@@ -47,7 +47,7 @@ except ImportError:
     pwc = None
 
 
-APP_VERSION = "v2026.05.04.033"
+APP_VERSION = "v2026.05.05.002"
 APP_NAME = "MapleStar EXP Tracker"
 APP_TITLE = f"MapleStar EXP Tracker {APP_VERSION}"
 APP_AUTHOR = "作者 by 胖胖布丁小紅"
