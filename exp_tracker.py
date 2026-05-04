@@ -47,7 +47,7 @@ except ImportError:
     pwc = None
 
 
-APP_VERSION = "v2026.05.04.032"
+APP_VERSION = "v2026.05.04.033"
 APP_NAME = "MapleStar EXP Tracker"
 APP_TITLE = f"MapleStar EXP Tracker {APP_VERSION}"
 APP_AUTHOR = "作者 by 胖胖布丁小紅"
@@ -4019,6 +4019,52 @@ OCR 診斷
             return best_raw
         return raw
 
+    def _correct_missing_prefix_by_manual_level_pct(self, raw, pct, visual_pct=None):
+        if self._manual_level is None or raw is None:
+            return raw
+        reference_pct = self._reference_progress_pct(pct, visual_pct)
+        if reference_pct is None or reference_pct <= 0 or reference_pct > 100:
+            return raw
+
+        manual_cap = float(MAPLESTAR_EXP_BY_LEVEL[self._manual_level])
+        expected_raw = manual_cap * (reference_pct / 100)
+        tolerance = max(MIN_DELTA_TOLERANCE, manual_cap * PROGRESS_RAW_TOLERANCE_RATIO)
+        if abs(raw - expected_raw) <= tolerance:
+            return raw
+
+        raw_digits = str(raw)
+        expected_digits = str(max(0, int(round(expected_raw))))
+        missing_count = len(expected_digits) - len(raw_digits)
+        if missing_count <= 0 or missing_count > 3:
+            return raw
+
+        current_distance = abs(raw - expected_raw)
+        min_prefix = 1 if missing_count == 1 else 10 ** (missing_count - 1)
+        max_prefix = (10 ** missing_count) - 1
+        candidates = []
+        for prefix in range(min_prefix, max_prefix + 1):
+            candidate = int(f"{prefix}{raw_digits}")
+            if candidate > manual_cap * MAX_RAW_OVER_LEVEL_CAP_RATIO:
+                continue
+            if (
+                self._last_raw is not None
+                and candidate < self._last_raw
+                and not is_level_reset(self._last_raw, self._last_pct, candidate, pct)
+            ):
+                continue
+            distance = abs(candidate - expected_raw)
+            if distance <= tolerance and current_distance - distance >= tolerance:
+                candidates.append((distance, candidate, prefix))
+
+        if not candidates:
+            return raw
+
+        _distance, corrected, prefix = min(candidates, key=lambda item: item[0])
+        self._last_ocr_text = (
+            f"{self._last_ocr_text}；依校正 Lv {self._manual_level} 與 {reference_pct:.2f}% 補回少讀前綴 {prefix}，修正為 {corrected:,}"
+        )
+        return corrected
+
     def _stabilize_overlay_sample(self, raw, pct, visual_pct, overlay_threshold=None):
         if raw is None:
             return raw, pct
@@ -4026,6 +4072,7 @@ OCR 診斷
         raw = self._correct_8_to_9_by_previous_raw(raw, pct)
         pct = self._correct_pct_8_to_9_by_manual_level(raw, pct)
         pct = self._correct_pct_by_manual_level_and_step(raw, pct)
+        raw = self._correct_missing_prefix_by_manual_level_pct(raw, pct, visual_pct)
         raw = self._correct_inserted_digit_by_level_cap(raw, pct)
         self._sync_manual_level_from_sample(raw, pct, visual_pct)
         if self._level_cap is not None and self._last_raw is not None:
@@ -4093,6 +4140,7 @@ OCR 診斷
         raw = self._correct_8_to_9_by_previous_raw(raw, pct)
         pct = self._correct_pct_8_to_9_by_manual_level(raw, pct)
         pct = self._correct_pct_by_manual_level_and_step(raw, pct)
+        raw = self._correct_missing_prefix_by_manual_level_pct(raw, pct, visual_pct)
         raw = self._correct_inserted_digit_by_level_cap(raw, pct)
         raw = self._correct_8_to_9_by_context(raw, pct)
         self._sync_manual_level_from_sample(raw, pct, visual_pct)
@@ -4235,12 +4283,12 @@ OCR 診斷
                     return False
             elif delta < 0:
                 self._clear_pending_jump()
-                if self._should_accept_backward_correction(previous_raw, previous_pct, raw, pct):
-                    self._accept_backward_correction(raw, pct, previous_raw)
-                else:
-                    self._ignored_samples += 1
-                    self.status.config(text="已忽略一次不可信 OCR：經驗值回退")
-                    return False
+                self._ignored_samples += 1
+                self.status.config(text="已忽略一次不可信 OCR：經驗值回退")
+                self._last_ocr_text = (
+                    f"{self._last_ocr_text}；同一等級 EXP 不應低於上一筆可信值 {previous_raw:,}，忽略 {raw:,}"
+                )
+                return False
 
         if raw is not None:
             self._last_raw = raw
