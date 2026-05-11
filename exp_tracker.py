@@ -10,6 +10,7 @@ Run:
 """
 
 import platform
+import itertools
 import json
 import math
 import os
@@ -47,7 +48,7 @@ except ImportError:
     pwc = None
 
 
-APP_VERSION = "v2026.05.05.002"
+APP_VERSION = "v2026.05.11.002"
 APP_NAME = "MapleStar EXP Tracker"
 APP_TITLE = f"MapleStar EXP Tracker {APP_VERSION}"
 APP_AUTHOR = "作者 by 胖胖布丁小紅"
@@ -66,15 +67,21 @@ DELTA_TOLERANCE_RATIO = 4.0
 CAP_TOLERANCE_RATIO = 0.0005
 BACKWARD_CORRECTION_CAP_RATIO = 0.003
 CONFUSED_DIGIT_CORRECTION_RATIO = 0.001
+CONFUSED_EXP_DIGITS = "689"
 PROGRESS_RAW_TOLERANCE_RATIO = 0.025
 MAX_RAW_OVER_LEVEL_CAP_RATIO = 1.02
 PCT_VISUAL_MISMATCH_TOLERANCE = 2.5
-MANUAL_LEVEL_AUTO_SYNC_LOOKAHEAD = 3
-MANUAL_LEVEL_AUTO_SYNC_MAX_ERROR = 0.015
+MANUAL_LEVEL_MISMATCH_LOOKAHEAD = 3
+MANUAL_LEVEL_MISMATCH_MAX_ERROR = 0.015
 MAX_MANUAL_LEVEL_DRIFT = 5
 MIN_LEVEL_RESET_PCT_DROP = 25.0
 MIN_LEVEL_RESET_PREVIOUS_PCT = 90.0
 MAX_LEVEL_RESET_CURRENT_PCT = 20.0
+LEVEL_RESET_PROGRESS_TOLERANCE_RATIO = 0.015
+LEVEL_RESET_REPEAT_CONFIRM_SECONDS = 2.0
+LEVEL_RESET_REPEAT_CONFIRM_SAMPLES = 2
+LEVEL_RESET_REPEAT_RAW_TOLERANCE_RATIO = 0.03
+LEVEL_RESET_REPEAT_PCT_TOLERANCE = 0.15
 BASELINE_CONFIRM_CAP_RATIO = 1.20
 LEVEL_ESTIMATE_MAX_ERROR = 0.08
 LEVEL_SAMPLE_STRONG_MAX_ERROR = 0.025
@@ -2292,6 +2299,12 @@ class ExpTracker:
         self._pending_jump_raw = None
         self._pending_jump_pct = None
         self._pending_jump_at = None
+        self._pending_level_reset_raw = None
+        self._pending_level_reset_pct = None
+        self._pending_level_reset_previous_raw = None
+        self._pending_level_reset_previous_pct = None
+        self._pending_level_reset_at = None
+        self._pending_level_reset_count = 0
         self._manual_exp_floor_raw = None
         self._manual_exp_floor_level = None
         self._level_cap = None
@@ -2305,6 +2318,7 @@ class ExpTracker:
         self._capture_count = 0
         self._recognized_count = 0
         self._last_ocr_text = ""
+        self._last_ocr_state = ""
         self._last_ocr_at = None
         self._last_error = ""
         self.session_start = None
@@ -3226,7 +3240,7 @@ class ExpTracker:
 1. 校準完成後按「開始追蹤」。
 2. 程式會先等待穩定讀值建立基準，所以剛開始幾秒鐘可能不會立刻顯示累積效率。
 3. 追蹤中請盡量不要移動遊戲視窗或遮住 EXP 區域。
-4. 升級後 EXP 歸零時，程式會依照上一個可靠基準估算跨級累積。
+4. 升級後 EXP 歸零時，程式會先確認新 EXP 符合下一級經驗表與百分比；若沒有立刻增加 EXP，穩定重複讀值也會完成確認。
 5. 追蹤中也可以調整更新頻率，新的秒數會在下一次取樣後生效。
 6. 按「縮小視窗」可切到精簡追蹤，顯示目前 EXP、近 5 分速率、5 分鐘、30 分鐘與升級時間預估。
 
@@ -3408,6 +3422,12 @@ OCR 診斷
         self._pending_jump_raw = None
         self._pending_jump_pct = None
         self._pending_jump_at = None
+        self._pending_level_reset_raw = None
+        self._pending_level_reset_pct = None
+        self._pending_level_reset_previous_raw = None
+        self._pending_level_reset_previous_pct = None
+        self._pending_level_reset_at = None
+        self._pending_level_reset_count = 0
         self._manual_exp_floor_raw = None
         self._manual_exp_floor_level = None
         self._level_cap = None
@@ -3421,6 +3441,7 @@ OCR 診斷
         self._capture_count = 0
         self._recognized_count = 0
         self._last_ocr_text = ""
+        self._last_ocr_state = ""
         self._last_ocr_at = None
         self._last_error = ""
         self.session_start = None
@@ -3430,7 +3451,7 @@ OCR 診斷
         self.rate_lbl.config(text="—")
         self._refresh_level_label()
         self.ocr_lbl.config(text="尚未開始取樣")
-        self.ocr_text_lbl.config(text="最後讀取：—")
+        self.ocr_text_lbl.config(text="最後讀取（待命）：—")
         for w in (self.eta5, self.eta10, self.eta30, self.eta_level):
             w.config(text="—")
         if hasattr(self, "compact_rate_lbl"):
@@ -3447,9 +3468,9 @@ OCR 診斷
         adjustment = 0
 
         if previous_raw is not None:
-            if is_level_reset(previous_raw, previous_pct, raw, pct):
+            if self._is_confirmed_level_reset(previous_raw, previous_pct, raw, pct):
                 previous_cap = self._sample_level_cap(previous_raw, previous_pct) or self._level_cap
-                if previous_cap and previous_cap >= previous_raw:
+                if previous_cap and previous_raw <= previous_cap * MAX_RAW_OVER_LEVEL_CAP_RATIO:
                     adjustment = max(0, int(round(previous_cap - previous_raw))) + raw
                     self._level_ups += 1
                     self._advance_manual_level()
@@ -3467,6 +3488,7 @@ OCR 診斷
         self._pending_pct = None
         self._pending_at = None
         self._clear_pending_jump()
+        self._clear_pending_level_reset()
         self._manual_exp_floor_raw = raw
         self._manual_exp_floor_level = self._manual_level or self._estimated_level
         self._update_level_estimate(raw, pct)
@@ -3486,6 +3508,7 @@ OCR 診斷
         else:
             correction_text = f"手動校正：{raw:,}"
         self._last_ocr_text = correction_text
+        self._last_ocr_state = "已採用"
         self._last_ocr_at = now
         self._last_error = ""
         rate_text, eta5_text, eta10_text, eta30_text, level_eta_text = self._rate_display_values()
@@ -3526,6 +3549,45 @@ OCR 診斷
             return float(sample_estimate[1])
         return level_cap_for_sample(raw, pct)
 
+    def _next_level_cap_for_reset(self, previous_raw, previous_pct):
+        current_level = self._manual_level or self._estimated_level
+        if current_level is not None:
+            next_level = self._valid_manual_level(current_level + 1)
+            if next_level is not None:
+                return float(MAPLESTAR_EXP_BY_LEVEL[next_level])
+
+        previous_cap = self._sample_level_cap(previous_raw, previous_pct) or self._level_cap
+        if previous_cap is None:
+            return None
+        best_level, best_cap = min(
+            MAPLESTAR_EXP_BY_LEVEL.items(),
+            key=lambda item: abs(item[1] - previous_cap),
+        )
+        next_level = self._valid_manual_level(best_level + 1)
+        if next_level is None:
+            return None
+        return float(MAPLESTAR_EXP_BY_LEVEL[next_level])
+
+    def _raw_matches_level_progress(self, raw, pct, level_cap):
+        if raw is None or pct is None or level_cap is None or pct < 0:
+            return False
+        if raw > level_cap * MAX_RAW_OVER_LEVEL_CAP_RATIO:
+            return False
+        expected_raw = level_cap * (pct / 100)
+        tolerance = max(MIN_DELTA_TOLERANCE, level_cap * LEVEL_RESET_PROGRESS_TOLERANCE_RATIO)
+        return abs(raw - expected_raw) <= tolerance
+
+    def _is_confirmed_level_reset(self, previous_raw, previous_pct, raw, pct, visual_pct=None):
+        if not is_level_reset(previous_raw, previous_pct, raw, pct):
+            return False
+        if visual_pct is not None and 0 <= visual_pct <= 100:
+            if abs(pct - visual_pct) > PCT_VISUAL_MISMATCH_TOLERANCE:
+                return False
+        next_cap = self._next_level_cap_for_reset(previous_raw, previous_pct)
+        if next_cap is None:
+            return False
+        return self._raw_matches_level_progress(raw, pct, next_cap)
+
     def _expected_raw_from_pct(self, pct):
         if self._level_cap is None or pct is None or pct < 0:
             return None
@@ -3539,6 +3601,57 @@ OCR 診斷
         if visual_valid:
             return visual_pct
         return None
+
+    def _correction_progress_pct(self, pct, visual_pct=None):
+        pct_valid = pct is not None and 0 <= pct <= 100
+        visual_valid = visual_pct is not None and 0 <= visual_pct <= 100
+        if visual_valid and (not pct_valid or abs(pct - visual_pct) > PCT_VISUAL_MISMATCH_TOLERANCE):
+            return visual_pct
+        if pct_valid:
+            return pct
+        if visual_valid:
+            return visual_pct
+        return None
+
+    def _correction_progress_pct_candidates(self, pct, visual_pct=None):
+        candidates = []
+
+        def add(candidate_pct, priority):
+            if candidate_pct is None or not 0 <= candidate_pct <= 100:
+                return
+            rounded = round(candidate_pct, 2)
+            if any(abs(existing_pct - rounded) <= 0.001 for _priority, existing_pct in candidates):
+                return
+            candidates.append((priority, rounded))
+
+        pct_valid = pct is not None and 0 <= pct <= 100
+        visual_valid = visual_pct is not None and 0 <= visual_pct <= 100
+        observed_pct_is_supported = (
+            pct_valid
+            and visual_valid
+            and abs(pct - visual_pct) <= PCT_VISUAL_MISMATCH_TOLERANCE
+        )
+        if visual_valid:
+            add(visual_pct, 0 if not pct_valid or abs(pct - visual_pct) > PCT_VISUAL_MISMATCH_TOLERANCE else 1)
+        if pct_valid:
+            add(pct, 1)
+            if not observed_pct_is_supported:
+                text = f"{pct:.2f}"
+                for idx, ch in enumerate(text):
+                    if ch not in CONFUSED_EXP_DIGITS:
+                        continue
+                    for replacement in CONFUSED_EXP_DIGITS:
+                        if replacement == ch:
+                            continue
+                        candidate_text = f"{text[:idx]}{replacement}{text[idx + 1:]}"
+                        try:
+                            add(float(candidate_text), 2)
+                        except ValueError:
+                            continue
+                if self._manual_level is not None:
+                    for offset in range(10, 100, 10):
+                        add(pct + offset, 3)
+        return candidates
 
     def _sample_level_estimate(self, raw, pct, visual_pct=None, max_error=LEVEL_SAMPLE_STRONG_MAX_ERROR):
         reference_pct = self._reference_progress_pct(pct, visual_pct)
@@ -3555,11 +3668,11 @@ OCR 診斷
             (self._level_cap or 0) * PROGRESS_RAW_TOLERANCE_RATIO,
         )
 
-    def _raw_step_is_plausible(self, raw, pct, reference_cap=None):
+    def _raw_step_is_plausible(self, raw, pct, reference_cap=None, visual_pct=None):
         if raw is None or self._last_raw is None:
             return False
         if raw < self._last_raw:
-            return is_level_reset(self._last_raw, self._last_pct, raw, pct)
+            return self._is_confirmed_level_reset(self._last_raw, self._last_pct, raw, pct, visual_pct)
         cap = reference_cap or self._level_cap
         if cap is not None and raw > cap * MAX_RAW_OVER_LEVEL_CAP_RATIO:
             return False
@@ -3580,10 +3693,12 @@ OCR 診斷
             return False
         reference_pct = self._reference_progress_pct(pct, visual_pct)
         if self._manual_level is not None:
+            if self._sample_suggests_different_manual_level(raw, pct, visual_pct):
+                return True
             manual_cap = float(MAPLESTAR_EXP_BY_LEVEL[self._manual_level])
             if raw > manual_cap * MAX_RAW_OVER_LEVEL_CAP_RATIO:
                 return False
-            if self._raw_step_is_plausible(raw, pct, manual_cap):
+            if self._raw_step_is_plausible(raw, pct, manual_cap, visual_pct):
                 return True
             expected_raw = manual_cap * (reference_pct / 100) if reference_pct is not None else None
             if expected_raw is None:
@@ -3610,27 +3725,45 @@ OCR 診斷
         if reference_pct is None or reference_pct <= 0:
             return None
         sample_cap = raw / (reference_pct / 100)
-        start = self._manual_level
-        end = min(MAX_MAPLESTAR_LEVEL, self._manual_level + MANUAL_LEVEL_AUTO_SYNC_LOOKAHEAD)
+        start = max(MIN_MAPLESTAR_LEVEL, self._manual_level - MANUAL_LEVEL_MISMATCH_LOOKAHEAD)
+        end = min(MAX_MAPLESTAR_LEVEL, self._manual_level + MANUAL_LEVEL_MISMATCH_LOOKAHEAD)
         best = None
         for level in range(start, end + 1):
             level_cap = MAPLESTAR_EXP_BY_LEVEL[level]
             error = abs(level_cap - sample_cap) / max(1, level_cap)
-            if error <= MANUAL_LEVEL_AUTO_SYNC_MAX_ERROR:
+            if error <= MANUAL_LEVEL_MISMATCH_MAX_ERROR:
                 candidate = (error, level, level_cap)
                 if best is None or candidate < best:
                     best = candidate
         return best
 
-    def _sync_manual_level_from_sample(self, raw, pct, visual_pct=None):
-        if self._manual_level is not None:
+    def _observed_pct_is_supported(self, pct, visual_pct=None):
+        return (
+            pct is not None
+            and 0 <= pct <= 100
+            and visual_pct is not None
+            and 0 <= visual_pct <= 100
+            and abs(pct - visual_pct) <= PCT_VISUAL_MISMATCH_TOLERANCE
+        )
+
+    def _sample_suggests_different_manual_level(self, raw, pct, visual_pct=None):
+        if not self._observed_pct_is_supported(pct, visual_pct):
+            return None
+        nearby = self._nearby_manual_level_for_sample(raw, pct, visual_pct)
+        if nearby is None:
+            return None
+        _error, level, _level_cap = nearby
+        if level == self._manual_level:
+            return None
+        return nearby
+
+    def _note_manual_level_mismatch(self, raw, pct, visual_pct=None):
+        if self._manual_level is None:
             return False
-        estimate = self._sample_level_estimate(raw, pct, visual_pct)
-        if estimate is None:
+        nearby = self._sample_suggests_different_manual_level(raw, pct, visual_pct)
+        if nearby is None:
             return False
-        level, level_cap, error = estimate
-        if self._manual_level is not None and abs(level - self._manual_level) > MAX_MANUAL_LEVEL_DRIFT:
-            return False
+        error, level, level_cap = nearby
         if (
             self._last_raw is not None
             and self._last_pct is not None
@@ -3642,15 +3775,10 @@ OCR 診斷
             tolerance = delta_tolerance(level_cap, expected_delta)
             if expected_delta is not None and raw - self._last_raw > expected_delta + tolerance:
                 return False
-        if self._manual_level is None or level == self._manual_level:
-            return False
-        self._estimated_level = level
-        self._level_estimate_error = error
-        self._level_cap = float(level_cap)
         self._last_ocr_text = (
-            f"{self._last_ocr_text}；EXP/% 較接近 Lv {level}，本次以讀值等級估算"
+            f"{self._last_ocr_text}；EXP/% 較接近 Lv {level}，但保留校正 Lv {self._manual_level}"
         )
-        self.status.config(text=f"校正等級與讀值不一致，暫以 Lv {level} 估算")
+        self.status.config(text=f"EXP/% 較接近 Lv {level}，已保留手動校正 Lv {self._manual_level}")
         return True
 
     def _protect_unstable_overlay_raw(self, raw, pct, visual_pct=None, reason="讀值偏離進度"):
@@ -3670,19 +3798,29 @@ OCR 診斷
         )
         return self._last_raw, self._last_pct
 
-    def _should_accept_backward_correction(self, previous_raw, previous_pct, raw, pct):
+    def _should_accept_backward_correction(self, previous_raw, previous_pct, raw, pct, visual_pct=None):
         if raw is None or previous_raw is None or raw >= previous_raw:
             return False
-        if is_level_reset(previous_raw, previous_pct, raw, pct):
+        if self._is_confirmed_level_reset(previous_raw, previous_pct, raw, pct, visual_pct):
+            return False
+        if (
+            pct is not None
+            and visual_pct is not None
+            and 0 <= visual_pct <= 100
+            and abs(pct - visual_pct) > PCT_VISUAL_MISMATCH_TOLERANCE
+        ):
             return False
         if self._below_manual_exp_floor(raw, pct):
             return False
+        if self._sample_suggests_different_manual_level(raw, pct, visual_pct):
+            return True
 
         tolerance = max(
             MIN_DELTA_TOLERANCE,
             (self._level_cap or 0) * BACKWARD_CORRECTION_CAP_RATIO,
         )
-        expected_raw = self._expected_raw_from_pct(pct)
+        reference_pct = self._reference_progress_pct(pct, visual_pct)
+        expected_raw = self._expected_raw_from_pct(reference_pct)
         if expected_raw is not None:
             previous_distance = abs(previous_raw - expected_raw)
             current_distance = abs(raw - expected_raw)
@@ -3714,17 +3852,209 @@ OCR 診斷
         self.status.config(text=f"已修正一次 OCR 高讀，扣回多算 {rollback:,} EXP")
         self._last_ocr_text = f"{self._last_ocr_text}；修正高讀，改採 {raw:,}"
 
+    def _previous_low_read_candidate(self, previous_raw, previous_pct, raw, pct, visual_pct=None, reference_cap=None):
+        if previous_raw is None or raw is None or previous_pct is None or pct is None:
+            return None
+        if raw <= previous_raw or pct < previous_pct:
+            return None
+        if self._is_confirmed_level_reset(previous_raw, previous_pct, raw, pct, visual_pct):
+            return None
+
+        cap = reference_cap or self._level_cap or self._sample_level_cap(raw, pct)
+        if cap is None or cap <= 0:
+            return None
+
+        reference_pct = self._reference_progress_pct(pct, visual_pct)
+        if reference_pct is None or reference_pct < previous_pct:
+            return None
+
+        expected_delta = expected_delta_from_percent(cap, reference_pct - previous_pct)
+        if expected_delta is None or expected_delta < 0:
+            return None
+
+        original_delta = raw - previous_raw
+        delta_tolerance_value = delta_tolerance(cap, expected_delta)
+        if original_delta <= expected_delta + delta_tolerance_value:
+            return None
+
+        progress_tolerance = max(MIN_DELTA_TOLERANCE, cap * PROGRESS_RAW_TOLERANCE_RATIO)
+        current_expected = cap * (reference_pct / 100)
+        if abs(raw - current_expected) > progress_tolerance:
+            return None
+
+        previous_targets = [
+            cap * (previous_pct / 100),
+            raw - expected_delta,
+        ]
+        original_progress_distance = min(abs(previous_raw - target) for target in previous_targets)
+        original_delta_distance = abs(original_delta - expected_delta)
+        min_improvement = max(MIN_DELTA_TOLERANCE / 4, cap * CONFUSED_DIGIT_CORRECTION_RATIO)
+
+        raw_digits = str(previous_raw)
+        positions = [idx for idx, ch in enumerate(raw_digits) if ch in CONFUSED_EXP_DIGITS]
+        if not positions:
+            return None
+
+        candidates = []
+        for flip_count in range(1, min(2, len(positions)) + 1):
+            for flip_positions in itertools.combinations(positions, flip_count):
+                replacement_options = [
+                    [digit for digit in CONFUSED_EXP_DIGITS if digit != raw_digits[idx]]
+                    for idx in flip_positions
+                ]
+                for replacements in itertools.product(*replacement_options):
+                    candidate_digits = list(raw_digits)
+                    changes = []
+                    for idx, new in zip(flip_positions, replacements):
+                        old = candidate_digits[idx]
+                        candidate_digits[idx] = new
+                        changes.append((idx, old, new))
+                    candidate = int("".join(candidate_digits))
+                    if candidate <= previous_raw or candidate > raw:
+                        continue
+                    if candidate > cap * MAX_RAW_OVER_LEVEL_CAP_RATIO:
+                        continue
+                    candidate_delta = raw - candidate
+                    candidate_delta_distance = abs(candidate_delta - expected_delta)
+                    candidate_progress_distance = min(abs(candidate - target) for target in previous_targets)
+                    delta_improvement = original_delta_distance - candidate_delta_distance
+                    progress_improvement = original_progress_distance - candidate_progress_distance
+                    if max(delta_improvement, progress_improvement) < min_improvement:
+                        continue
+                    if (
+                        candidate_delta_distance > delta_tolerance_value
+                        and candidate_progress_distance > progress_tolerance
+                    ):
+                        continue
+                    candidates.append((
+                        candidate_delta_distance,
+                        candidate_progress_distance,
+                        flip_count,
+                        candidate,
+                        changes,
+                    ))
+
+        if not candidates:
+            return None
+
+        _delta_distance, _progress_distance, _flip_count, corrected, changes = min(
+            candidates,
+            key=lambda item: (item[2], item[0], item[1], item[3]),
+        )
+        return corrected, changes
+
+    def _correct_previous_low_read(self, previous_raw, previous_pct, raw, pct, visual_pct=None, reference_cap=None):
+        candidate = self._previous_low_read_candidate(previous_raw, previous_pct, raw, pct, visual_pct, reference_cap)
+        if candidate is None:
+            return previous_raw
+
+        corrected, changes = candidate
+        correction = corrected - previous_raw
+        gained_adjustment = 0
+        if self.samples and self.samples[-1][2] == previous_raw:
+            last_t, last_gained, _last_raw, last_pct = self.samples[-1]
+            if len(self.samples) >= 2:
+                gained_adjustment = correction
+            self.samples[-1] = (last_t, max(0, last_gained + gained_adjustment), corrected, last_pct)
+
+        if gained_adjustment:
+            self.total_gained = max(0, self.total_gained + gained_adjustment)
+
+        self._last_raw = corrected
+        change_text = "、".join(
+            f"第 {idx + 1} 位 {old}->{new}" for idx, old, new in changes
+        )
+        adjustment_text = f"，累積補回 {gained_adjustment:,} EXP" if gained_adjustment else ""
+        self.status.config(text=f"已修正上一筆 OCR 低讀{adjustment_text}")
+        self._last_ocr_text = (
+            f"{self._last_ocr_text}；修正上一筆低讀（{change_text}）：{previous_raw:,} -> {corrected:,}{adjustment_text}"
+        )
+        return corrected
+
     def _clear_pending_jump(self):
         self._pending_jump_raw = None
         self._pending_jump_pct = None
         self._pending_jump_at = None
+
+    def _clear_pending_level_reset(self):
+        self._pending_level_reset_raw = None
+        self._pending_level_reset_pct = None
+        self._pending_level_reset_previous_raw = None
+        self._pending_level_reset_previous_pct = None
+        self._pending_level_reset_at = None
+        self._pending_level_reset_count = 0
+
+    def _pending_level_reset_repeats(self, raw, pct):
+        if self._pending_level_reset_raw is None:
+            return False
+        if raw is not None and self._pending_level_reset_raw is not None:
+            raw_tolerance = max(
+                2_000,
+                self._pending_level_reset_raw * LEVEL_RESET_REPEAT_RAW_TOLERANCE_RATIO,
+            )
+            if abs(raw - self._pending_level_reset_raw) > raw_tolerance:
+                return False
+        if pct is not None and self._pending_level_reset_pct is not None:
+            if abs(pct - self._pending_level_reset_pct) > LEVEL_RESET_REPEAT_PCT_TOLERANCE:
+                return False
+        return True
+
+    def _remember_pending_level_reset(self, raw, pct, previous_raw, previous_pct, t):
+        same_previous = (
+            self._pending_level_reset_previous_raw == previous_raw
+            and self._pending_level_reset_previous_pct == previous_pct
+        )
+        if self._pending_level_reset_raw is not None and same_previous and self._pending_level_reset_repeats(raw, pct):
+            self._pending_level_reset_count += 1
+            return
+        self._pending_level_reset_raw = raw
+        self._pending_level_reset_pct = pct
+        self._pending_level_reset_previous_raw = previous_raw
+        self._pending_level_reset_previous_pct = previous_pct
+        self._pending_level_reset_at = t
+        self._pending_level_reset_count = 1
+
+    def _pending_level_reset_confirmed(self, raw, pct, visual_pct=None, t=None):
+        if self._pending_level_reset_raw is None:
+            return False
+        if not self._is_confirmed_level_reset(
+            self._pending_level_reset_previous_raw,
+            self._pending_level_reset_previous_pct,
+            raw,
+            pct,
+            visual_pct,
+        ):
+            return False
+        raw_progressed = (
+            raw is not None
+            and raw > self._pending_level_reset_raw + max(1_000, self._pending_level_reset_raw * 0.003)
+        )
+        pct_progressed = (
+            pct is not None
+            and self._pending_level_reset_pct is not None
+            and pct > self._pending_level_reset_pct + 0.01
+        )
+        if raw_progressed or pct_progressed:
+            return True
+
+        if not self._pending_level_reset_repeats(raw, pct):
+            return False
+        if self._pending_level_reset_at is None:
+            return False
+        now = t if t is not None else time.time()
+        repeated_samples = self._pending_level_reset_count + 1
+        elapsed_s = now - self._pending_level_reset_at
+        return (
+            repeated_samples >= LEVEL_RESET_REPEAT_CONFIRM_SAMPLES
+            and elapsed_s >= LEVEL_RESET_REPEAT_CONFIRM_SECONDS
+        )
 
     def _below_manual_exp_floor(self, raw, pct):
         if self._manual_exp_floor_raw is None or raw is None:
             return False
         if raw >= self._manual_exp_floor_raw:
             return False
-        if is_level_reset(self._manual_exp_floor_raw, self._last_pct, raw, pct):
+        if self._is_confirmed_level_reset(self._manual_exp_floor_raw, self._last_pct, raw, pct):
             return False
         current_level = self._manual_level or self._estimated_level
         if (
@@ -3804,6 +4134,113 @@ OCR 診斷
         tolerance = max(MIN_DELTA_TOLERANCE, cap * PROGRESS_RAW_TOLERANCE_RATIO)
         return abs(raw - expected_raw) <= tolerance
 
+    def _progress_expected_raws(self, reference_cap, reference_pct, include_last_raw=True):
+        expected = []
+        if reference_cap is not None and reference_pct is not None:
+            expected.append(reference_cap * (reference_pct / 100))
+            if self._last_raw is not None and self._last_pct is not None:
+                expected_delta = expected_delta_from_percent(reference_cap, reference_pct - self._last_pct)
+                if expected_delta is not None:
+                    expected.append(self._last_raw + expected_delta)
+        if include_last_raw and self._last_raw is not None:
+            expected.append(self._last_raw)
+        return expected
+
+    def _correct_confused_digits_by_context(self, raw, pct, visual_pct=None):
+        if raw is None or self._level_cap is None:
+            return raw
+        manual_level_mismatch = self._sample_suggests_different_manual_level(raw, pct, visual_pct)
+        raw_digits = str(raw)
+        positions = [idx for idx, ch in enumerate(raw_digits) if ch in CONFUSED_EXP_DIGITS]
+        if not positions:
+            return raw
+
+        reference_cap = self._level_cap
+        if self._manual_level is not None:
+            reference_cap = float(MAPLESTAR_EXP_BY_LEVEL[self._manual_level])
+        if reference_cap is None:
+            return raw
+
+        pct_candidates = self._correction_progress_pct_candidates(pct, visual_pct)
+        if not pct_candidates:
+            return raw
+
+        tolerance = max(MIN_DELTA_TOLERANCE, reference_cap * PROGRESS_RAW_TOLERANCE_RATIO)
+        min_improvement = max(MIN_DELTA_TOLERANCE / 4, reference_cap * CONFUSED_DIGIT_CORRECTION_RATIO)
+        if manual_level_mismatch:
+            min_improvement = max(min_improvement, tolerance * 0.25)
+        candidates = []
+        max_flips = min(2, len(positions))
+        if manual_level_mismatch:
+            max_flips = 1
+        observed_pct_is_supported = self._observed_pct_is_supported(pct, visual_pct)
+
+        for pct_priority, reference_pct in pct_candidates:
+            if manual_level_mismatch and pct_priority > 1:
+                continue
+            if manual_level_mismatch:
+                expected_raws = [reference_cap * (reference_pct / 100)]
+            else:
+                expected_raws = self._progress_expected_raws(
+                    reference_cap,
+                    reference_pct,
+                    include_last_raw=not observed_pct_is_supported,
+                )
+            if not expected_raws:
+                continue
+            current_distance = min(abs(raw - expected_raw) for expected_raw in expected_raws)
+            if current_distance <= min_improvement:
+                continue
+
+            for flip_count in range(1, max_flips + 1):
+                for flip_positions in itertools.combinations(positions, flip_count):
+                    replacement_options = [
+                        [digit for digit in CONFUSED_EXP_DIGITS if digit != raw_digits[idx]]
+                        for idx in flip_positions
+                    ]
+                    for replacements in itertools.product(*replacement_options):
+                        candidate_digits = list(raw_digits)
+                        changes = []
+                        for idx, new in zip(flip_positions, replacements):
+                            old = candidate_digits[idx]
+                            candidate_digits[idx] = new
+                            changes.append((idx, old, new))
+                        candidate = int("".join(candidate_digits))
+                        if candidate == raw or candidate > reference_cap * MAX_RAW_OVER_LEVEL_CAP_RATIO:
+                            continue
+                        candidate_distance = min(abs(candidate - expected_raw) for expected_raw in expected_raws)
+                        improvement = current_distance - candidate_distance
+                        if improvement < min_improvement:
+                            continue
+                        if manual_level_mismatch and candidate_distance > tolerance:
+                            continue
+                        if candidate_distance > max(tolerance, current_distance * 0.5):
+                            continue
+                        candidates.append((
+                            candidate_distance,
+                            -improvement,
+                            pct_priority,
+                            flip_count,
+                            candidate,
+                            changes,
+                            reference_pct,
+                        ))
+
+        if not candidates:
+            return raw
+
+        _distance, _improvement, _pct_priority, _flip_count, corrected, changes, reference_pct = min(
+            candidates,
+            key=lambda item: (item[2], item[3], item[0], item[1]),
+        )
+        change_text = "、".join(
+            f"第 {idx + 1} 位 {old}->{new}" for idx, old, new in changes
+        )
+        self._last_ocr_text = (
+            f"{self._last_ocr_text}；依等級與 {reference_pct:.2f}% 修正 6/8/9 混淆（{change_text}）：{corrected:,}"
+        )
+        return corrected
+
     def _correct_8_to_9_by_context(self, raw, pct):
         if raw is None or pct is None or self._level_cap is None:
             return raw
@@ -3830,7 +4267,7 @@ OCR 診斷
             if self._last_raw is not None and self._last_pct is not None:
                 if pct >= self._last_pct and candidate < self._last_raw:
                     continue
-                if pct < self._last_pct and not is_level_reset(self._last_raw, self._last_pct, candidate, pct):
+                if pct < self._last_pct and not self._is_confirmed_level_reset(self._last_raw, self._last_pct, candidate, pct):
                     continue
             candidate_distance = abs(candidate - expected_raw)
             improvement = current_distance - candidate_distance
@@ -3844,42 +4281,65 @@ OCR 診斷
         self._last_ocr_text = f"{self._last_ocr_text}；依等級與百分比將第 {idx + 1} 位 8 修正為 9：{corrected:,}"
         return corrected
 
-    def _correct_8_to_9_by_previous_raw(self, raw, pct):
+    def _correct_8_to_9_by_previous_raw(self, raw, pct, visual_pct=None):
         if raw is None or self._last_raw is None:
             return raw
         if raw >= self._last_raw:
             return raw
-        if is_level_reset(self._last_raw, self._last_pct, raw, pct):
+        if self._is_confirmed_level_reset(self._last_raw, self._last_pct, raw, pct, visual_pct):
+            return raw
+        if self._sample_suggests_different_manual_level(raw, pct, visual_pct):
             return raw
 
         digits = str(raw)
-        if "8" not in digits:
+        if not any(ch in CONFUSED_EXP_DIGITS for ch in digits):
             return raw
 
         reference_cap = self._level_cap
         if self._manual_level is not None:
             reference_cap = float(MAPLESTAR_EXP_BY_LEVEL[self._manual_level])
         max_step = max(MIN_DELTA_TOLERANCE * 4, (reference_cap or self._last_raw) * 0.025)
+        reference_pct = self._correction_progress_pct(pct, visual_pct)
+        expected_raw = None
+        min_progress_improvement = MIN_DELTA_TOLERANCE / 4
+        if reference_cap is not None and reference_pct is not None:
+            expected_raw = reference_cap * (reference_pct / 100)
+            min_progress_improvement = max(
+                min_progress_improvement,
+                reference_cap * CONFUSED_DIGIT_CORRECTION_RATIO,
+            )
+            original_distance = abs(raw - expected_raw)
+        else:
+            original_distance = None
         candidates = []
         for idx, ch in enumerate(digits):
-            if ch != "8":
+            if ch not in CONFUSED_EXP_DIGITS:
                 continue
-            candidate = int(f"{digits[:idx]}9{digits[idx + 1:]}")
-            if candidate < self._last_raw:
-                continue
-            if reference_cap is not None and candidate > reference_cap * MAX_RAW_OVER_LEVEL_CAP_RATIO:
-                continue
-            delta = candidate - self._last_raw
-            if delta > max_step:
-                continue
-            candidates.append((delta, candidate, idx))
+            for replacement in CONFUSED_EXP_DIGITS:
+                if replacement == ch:
+                    continue
+                candidate = int(f"{digits[:idx]}{replacement}{digits[idx + 1:]}")
+                if candidate < self._last_raw:
+                    continue
+                if reference_cap is not None and candidate > reference_cap * MAX_RAW_OVER_LEVEL_CAP_RATIO:
+                    continue
+                delta = candidate - self._last_raw
+                if delta > max_step:
+                    continue
+                if expected_raw is not None:
+                    candidate_distance = abs(candidate - expected_raw)
+                    if original_distance is not None and original_distance - candidate_distance < min_progress_improvement:
+                        continue
+                else:
+                    candidate_distance = 0
+                candidates.append((candidate_distance, delta, candidate, idx, ch, replacement))
 
         if not candidates:
             return raw
 
-        delta, corrected, idx = min(candidates, key=lambda item: item[0])
+        _candidate_distance, _delta, corrected, idx, old, new = min(candidates, key=lambda item: (item[0], item[1]))
         self._last_ocr_text = (
-            f"{self._last_ocr_text}；依上一筆可信 EXP 將第 {idx + 1} 位 8 修正為 9：{corrected:,}"
+            f"{self._last_ocr_text}；依上一筆可信 EXP 修正 6/8/9 混淆（第 {idx + 1} 位 {old}->{new}）：{corrected:,}"
         )
         return corrected
 
@@ -3903,7 +4363,7 @@ OCR 診斷
             return candidate_pct
         return pct
 
-    def _correct_pct_by_manual_level_and_step(self, raw, pct):
+    def _correct_pct_by_manual_level_and_step(self, raw, pct, visual_pct=None):
         if self._manual_level is None or raw is None:
             return pct
         manual_cap = float(MAPLESTAR_EXP_BY_LEVEL[self._manual_level])
@@ -3914,7 +4374,32 @@ OCR 診斷
             return pct
         if pct is not None and abs(pct - inferred_pct) < PCT_VISUAL_MISMATCH_TOLERANCE:
             return pct
-        if self._last_raw is not None and not self._raw_step_is_plausible(raw, inferred_pct, manual_cap):
+        visual_supports_raw = (
+            visual_pct is not None
+            and 0 <= visual_pct <= 100
+            and abs(visual_pct - inferred_pct) <= PCT_VISUAL_MISMATCH_TOLERANCE
+        )
+        observed_pct_is_supported = (
+            pct is not None
+            and visual_pct is not None
+            and 0 <= visual_pct <= 100
+            and abs(pct - visual_pct) <= PCT_VISUAL_MISMATCH_TOLERANCE
+        )
+        if observed_pct_is_supported and not visual_supports_raw:
+            return pct
+        pct_tens_shift_supports_raw = False
+        if pct is not None:
+            pct_shift = inferred_pct - pct
+            pct_tens_shift_supports_raw = (
+                pct_shift > 0
+                and abs(pct_shift - round(pct_shift / 10) * 10) <= PCT_VISUAL_MISMATCH_TOLERANCE
+            )
+        if (
+            self._last_raw is not None
+            and not visual_supports_raw
+            and not pct_tens_shift_supports_raw
+            and not self._raw_step_is_plausible(raw, inferred_pct, manual_cap, visual_pct)
+        ):
             return pct
 
         corrected_pct = round(inferred_pct, 2)
@@ -3928,8 +4413,11 @@ OCR 診斷
             )
         return corrected_pct
 
-    def _correct_inserted_digit_by_level_cap(self, raw, pct):
-        if raw is None or pct is None or self._level_cap is None:
+    def _correct_inserted_digit_by_level_cap(self, raw, pct, visual_pct=None):
+        if raw is None or self._level_cap is None:
+            return raw
+        correction_pcts = self._correction_progress_pct_candidates(pct, visual_pct)
+        if not correction_pcts:
             return raw
         raw_digits = str(raw)
         if len(raw_digits) < 2:
@@ -3940,81 +4428,97 @@ OCR 診斷
         reference_level_cap = self._level_cap
         if self._manual_level is not None:
             reference_level_cap = float(MAPLESTAR_EXP_BY_LEVEL[self._manual_level])
-        if pct > 0:
-            expected_raw_for_level = reference_level_cap * (pct / 100)
+
+        candidates = []
+        original_best_ratio = None
+        for pct_priority, correction_pct in correction_pcts:
+            if correction_pct <= 0:
+                continue
+            expected_raw_for_level = reference_level_cap * (correction_pct / 100)
             tolerance_for_level = max(MIN_DELTA_TOLERANCE, reference_level_cap * PROGRESS_RAW_TOLERANCE_RATIO)
             if abs(raw - expected_raw_for_level) <= tolerance_for_level:
                 return raw
 
-        original_cap = level_cap_for_sample(raw, pct)
-        original_ratio = None
-        if original_cap:
-            smaller = max(1, min(original_cap, reference_level_cap))
-            original_ratio = max(original_cap, reference_level_cap) / smaller
+            original_cap = level_cap_for_sample(raw, correction_pct)
+            if original_cap:
+                smaller = max(1, min(original_cap, reference_level_cap))
+                original_ratio = max(original_cap, reference_level_cap) / smaller
+                if original_best_ratio is None or original_ratio < original_best_ratio:
+                    original_best_ratio = original_ratio
 
-        expected_raw = None
-        if self._last_raw is not None and self._last_pct is not None:
-            pct_delta = pct - self._last_pct
-            expected_delta = expected_delta_from_percent(reference_level_cap, pct_delta)
-            if expected_delta is not None:
-                expected_raw = self._last_raw + expected_delta
-        if expected_raw is None:
-            expected_raw = self._last_raw
-        if expected_raw is None and pct is not None and pct > 0:
-            expected_raw = reference_level_cap * (pct / 100)
+            expected_raw = None
+            if self._last_raw is not None and self._last_pct is not None:
+                pct_delta = correction_pct - self._last_pct
+                expected_delta = expected_delta_from_percent(reference_level_cap, pct_delta)
+                if expected_delta is not None:
+                    expected_raw = self._last_raw + expected_delta
+            if expected_raw is None:
+                expected_raw = self._last_raw
+            if expected_raw is None:
+                expected_raw = expected_raw_for_level
 
-        target_lengths = set()
-        if self._last_raw is not None:
-            last_len = len(str(self._last_raw))
-            target_lengths.update({last_len - 1, last_len, last_len + 1})
-        if reference_level_cap is not None and pct > 0:
-            expected_raw_from_cap = int(round(reference_level_cap * (pct / 100)))
+            target_lengths = set()
+            if self._last_raw is not None:
+                last_len = len(str(self._last_raw))
+                target_lengths.update({last_len - 1, last_len, last_len + 1})
+            expected_raw_from_cap = int(round(expected_raw_for_level))
             cap_len = len(str(max(0, expected_raw_from_cap)))
             target_lengths.update({cap_len - 1, cap_len, cap_len + 1})
-        target_lengths = {length for length in target_lengths if 2 <= length < len(raw_digits)}
-        if not target_lengths:
-            target_lengths.add(len(raw_digits) - 1)
+            target_lengths = {length for length in target_lengths if 2 <= length < len(raw_digits)}
+            if not target_lengths:
+                target_lengths.add(len(raw_digits) - 1)
 
-        candidates = []
-        pct_int_text = str(int(pct)) if pct is not None else ""
-        pct_digits = f"{pct:.2f}".replace(".", "") if pct is not None else ""
-        for target_len in sorted(target_lengths, reverse=True):
-            remove_count = len(raw_digits) - target_len
-            for remove_start in range(0, len(raw_digits) - remove_count + 1):
-                candidate_digits = raw_digits[:remove_start] + raw_digits[remove_start + remove_count :]
-                if not candidate_digits or candidate_digits.startswith("0"):
-                    continue
-                candidate = int(candidate_digits)
-                if self._last_raw is not None and candidate < self._last_raw and (self._last_pct is None or pct >= self._last_pct):
-                    continue
-                candidate_cap = level_cap_for_sample(candidate, pct)
-                if candidate_cap is None:
-                    continue
-                smaller = max(1, min(candidate_cap, reference_level_cap))
-                ratio = max(candidate_cap, reference_level_cap) / smaller
-                target_distance = abs(candidate - expected_raw) if expected_raw is not None else 0
-                removed = raw_digits[remove_start : remove_start + remove_count]
-                suffix_pollution = (
-                    remove_start == target_len
-                    and removed
-                    and (
-                        removed == pct_int_text
-                        or removed == f"1{pct_int_text}"
-                        or pct_digits.startswith(removed)
-                        or pct_digits.startswith(removed.lstrip("1"))
+            pct_int_text = str(int(correction_pct))
+            pct_digits = f"{correction_pct:.2f}".replace(".", "")
+            for target_len in sorted(target_lengths, reverse=True):
+                remove_count = len(raw_digits) - target_len
+                for remove_start in range(0, len(raw_digits) - remove_count + 1):
+                    candidate_digits = raw_digits[:remove_start] + raw_digits[remove_start + remove_count :]
+                    if not candidate_digits or candidate_digits.startswith("0"):
+                        continue
+                    candidate = int(candidate_digits)
+                    if self._last_raw is not None and candidate < self._last_raw and (self._last_pct is None or correction_pct >= self._last_pct):
+                        continue
+                    candidate_cap = level_cap_for_sample(candidate, correction_pct)
+                    if candidate_cap is None:
+                        continue
+                    smaller = max(1, min(candidate_cap, reference_level_cap))
+                    ratio = max(candidate_cap, reference_level_cap) / smaller
+                    target_distance = abs(candidate - expected_raw) if expected_raw is not None else 0
+                    removed = raw_digits[remove_start : remove_start + remove_count]
+                    suffix_pollution = (
+                        remove_start == target_len
+                        and removed
+                        and (
+                            removed == pct_int_text
+                            or removed == f"1{pct_int_text}"
+                            or pct_digits.startswith(removed)
+                            or pct_digits.startswith(removed.lstrip("1"))
+                        )
                     )
-                )
-                candidates.append((0 if suffix_pollution else 1, ratio, target_distance, remove_count, candidate, removed))
+                    candidates.append((
+                        0 if suffix_pollution else 1,
+                        ratio,
+                        target_distance,
+                        pct_priority,
+                        remove_count,
+                        candidate,
+                        removed,
+                        correction_pct,
+                    ))
 
         if not candidates:
             return raw
 
         acceptable = [item for item in candidates if item[1] <= BASELINE_CONFIRM_CAP_RATIO]
         pool = acceptable or candidates
-        _suffix_rank, best_ratio, _distance, _remove_count, best_raw, removed = min(pool, key=lambda item: (item[2], item[0], item[1], item[3]))
-        if best_ratio <= BASELINE_CONFIRM_CAP_RATIO and (original_ratio is None or best_ratio < original_ratio):
+        _suffix_rank, best_ratio, _distance, _pct_priority, _remove_count, best_raw, removed, correction_pct = min(
+            pool,
+            key=lambda item: (item[2], item[0], item[1], item[3], item[4]),
+        )
+        if best_ratio <= BASELINE_CONFIRM_CAP_RATIO and (original_best_ratio is None or best_ratio < original_best_ratio):
             self._last_ocr_text = (
-                f"{self._last_ocr_text}；依等級基準移除疑似多讀位數 {removed}，修正為 {best_raw:,}"
+                f"{self._last_ocr_text}；依等級基準與 {correction_pct:.2f}% 移除疑似多讀位數 {removed}，修正為 {best_raw:,}"
             )
             return best_raw
         return raw
@@ -4049,7 +4553,7 @@ OCR 診斷
             if (
                 self._last_raw is not None
                 and candidate < self._last_raw
-                and not is_level_reset(self._last_raw, self._last_pct, candidate, pct)
+                and not self._is_confirmed_level_reset(self._last_raw, self._last_pct, candidate, pct, visual_pct)
             ):
                 continue
             distance = abs(candidate - expected_raw)
@@ -4069,12 +4573,16 @@ OCR 診斷
         if raw is None:
             return raw, pct
         threshold = overlay_threshold if overlay_threshold is not None else self._overlay_threshold_pct(raw, pct)
-        raw = self._correct_8_to_9_by_previous_raw(raw, pct)
+        raw = self._correct_8_to_9_by_previous_raw(raw, pct, visual_pct)
         pct = self._correct_pct_8_to_9_by_manual_level(raw, pct)
-        pct = self._correct_pct_by_manual_level_and_step(raw, pct)
+        pct = self._correct_pct_by_manual_level_and_step(raw, pct, visual_pct)
+        raw = self._correct_confused_digits_by_context(raw, pct, visual_pct)
+        pct = self._correct_pct_by_manual_level_and_step(raw, pct, visual_pct)
         raw = self._correct_missing_prefix_by_manual_level_pct(raw, pct, visual_pct)
-        raw = self._correct_inserted_digit_by_level_cap(raw, pct)
-        self._sync_manual_level_from_sample(raw, pct, visual_pct)
+        raw = self._correct_inserted_digit_by_level_cap(raw, pct, visual_pct)
+        raw = self._correct_confused_digits_by_context(raw, pct, visual_pct)
+        pct = self._correct_pct_by_manual_level_and_step(raw, pct, visual_pct)
+        self._note_manual_level_mismatch(raw, pct, visual_pct)
         if self._level_cap is not None and self._last_raw is not None:
             raw, pct = self._protect_unstable_overlay_raw(raw, pct, visual_pct, reason="讀值偏離進度")
         if visual_pct is None or visual_pct < threshold:
@@ -4097,6 +4605,46 @@ OCR 診斷
         )
         return self._last_raw, self._last_pct
 
+    def _classify_last_sample_state(self, accepted, raw):
+        if raw is None:
+            return "未讀到 EXP"
+
+        text = self._last_ocr_text or ""
+        waiting_markers = (
+            "等待下一",
+            "等待第二",
+            "等待下一筆",
+            "等待下一次",
+            "等待下一級",
+            "等待下一筆確認",
+            "確認中",
+            "暫不採用",
+            "暫不加入",
+            "正在校準",
+        )
+        ignored_markers = (
+            "忽略",
+            "保留上一筆可信值",
+            "低於手動校正",
+            "不一致",
+            "回退",
+            "少讀",
+            "異常",
+        )
+        if any(marker in text for marker in waiting_markers):
+            return "待確認"
+        if any(marker in text for marker in ignored_markers):
+            return "已忽略"
+        if accepted:
+            return "已採用"
+        if (
+            self._pending_raw is not None
+            or self._pending_jump_raw is not None
+            or self._pending_level_reset_raw is not None
+        ):
+            return "待確認"
+        return "已忽略"
+
     def _loop(self):
         with mss.mss() as sct:
             while self.running:
@@ -4116,15 +4664,20 @@ OCR 診斷
                     visual_pct = estimate_bar_percent(pil)
                     self._capture_count += 1
                     self._last_ocr_text = text
+                    self._last_ocr_state = "待判斷"
                     self._last_ocr_at = time.time()
                     self._last_error = ""
                     overlay_threshold = self._dynamic_overlay_threshold_pct(pil, raw, pct)
                     raw, pct = self._stabilize_overlay_sample(raw, pct, visual_pct, overlay_threshold)
+                    accepted = False
                     if raw is not None:
-                        if self._add_sample(time.time(), raw, pct, visual_pct):
+                        accepted = self._add_sample(time.time(), raw, pct, visual_pct)
+                        if accepted:
                             self._recognized_count += 1
+                    self._last_ocr_state = self._classify_last_sample_state(accepted, raw)
                 except Exception as e:
                     self._last_error = str(e)
+                    self._last_ocr_state = "錯誤"
                     print(f"sample error: {e}", file=sys.stderr)
                 wait_until = time.time() + float(self.sample_interval)
                 while self.running and time.time() < wait_until:
@@ -4137,13 +4690,17 @@ OCR 診斷
 
         if raw is None:
             return False
-        raw = self._correct_8_to_9_by_previous_raw(raw, pct)
+        raw = self._correct_8_to_9_by_previous_raw(raw, pct, visual_pct)
         pct = self._correct_pct_8_to_9_by_manual_level(raw, pct)
-        pct = self._correct_pct_by_manual_level_and_step(raw, pct)
+        pct = self._correct_pct_by_manual_level_and_step(raw, pct, visual_pct)
+        raw = self._correct_confused_digits_by_context(raw, pct, visual_pct)
+        pct = self._correct_pct_by_manual_level_and_step(raw, pct, visual_pct)
         raw = self._correct_missing_prefix_by_manual_level_pct(raw, pct, visual_pct)
-        raw = self._correct_inserted_digit_by_level_cap(raw, pct)
+        raw = self._correct_inserted_digit_by_level_cap(raw, pct, visual_pct)
+        raw = self._correct_confused_digits_by_context(raw, pct, visual_pct)
+        pct = self._correct_pct_by_manual_level_and_step(raw, pct, visual_pct)
         raw = self._correct_8_to_9_by_context(raw, pct)
-        self._sync_manual_level_from_sample(raw, pct, visual_pct)
+        self._note_manual_level_mismatch(raw, pct, visual_pct)
         if self._below_manual_exp_floor(raw, pct):
             self._clear_pending_jump()
             self._ignored_samples += 1
@@ -4199,6 +4756,14 @@ OCR 診斷
             return True
 
         if raw is not None and previous_raw is not None:
+            previous_raw = self._correct_previous_low_read(
+                previous_raw,
+                previous_pct,
+                raw,
+                pct,
+                visual_pct,
+                self._level_cap or sample_cap,
+            )
             delta = raw - previous_raw
             pct_delta = None
             if pct is not None and previous_pct is not None:
@@ -4209,7 +4774,7 @@ OCR 診斷
                 smaller = max(1, min(sample_cap, self._level_cap))
                 cap_ratio = max(sample_cap, self._level_cap) / smaller
 
-            level_reset = is_level_reset(previous_raw, previous_pct, raw, pct)
+            level_reset = self._is_confirmed_level_reset(previous_raw, previous_pct, raw, pct, visual_pct)
             if cap_ratio is not None and cap_ratio > MAX_LEVEL_CAP_RATIO_JUMP:
                 if sample_cap < self._level_cap and not level_reset:
                     self._ignored_samples += 1
@@ -4236,6 +4801,7 @@ OCR 診斷
                 elapsed_s = max(float(self.sample_interval), t - self.samples[-1][0]) if self.samples else float(self.sample_interval)
                 if not self._large_gain_matches_progress(raw, pct, visual_pct, delta, reference_cap):
                     self._clear_pending_jump()
+                    self._clear_pending_level_reset()
                     self._ignored_samples += 1
                     reference_pct = self._reference_progress_pct(visual_pct, pct)
                     expected_raw = reference_cap * (reference_pct / 100) if reference_cap and reference_pct is not None else None
@@ -4250,6 +4816,7 @@ OCR 診斷
                     not confirmed_pending_jump
                     and self._gain_delta_needs_confirmation(delta, elapsed_s, reference_cap)
                 ):
+                    self._clear_pending_level_reset()
                     self._pending_jump_raw = raw
                     self._pending_jump_pct = pct
                     self._pending_jump_at = t
@@ -4260,20 +4827,32 @@ OCR 診斷
                     )
                     return False
                 self._clear_pending_jump()
+                self._clear_pending_level_reset()
                 self.total_gained += delta
             elif delta > 0:
                 self._clear_pending_jump()
+                self._clear_pending_level_reset()
                 self._ignored_samples += 1
                 self.status.config(text="已忽略一次異常跳動，並重新校準 EXP 基準")
                 return False
             elif level_reset:
                 self._clear_pending_jump()
+                if not self._pending_level_reset_confirmed(raw, pct, visual_pct, t):
+                    self._remember_pending_level_reset(raw, pct, previous_raw, previous_pct, t)
+                    self._ignored_samples += 1
+                    self.status.config(text="已偵測到升級後 EXP，正在確認下一級")
+                    self._last_ocr_text = (
+                        f"{self._last_ocr_text}；升級保護：暫不採用 {raw:,}[{pct:.2f}%]，升級確認中"
+                    )
+                    return False
+                self._clear_pending_level_reset()
                 previous_cap = self._sample_level_cap(previous_raw, previous_pct) or self._level_cap
-                if previous_cap and previous_cap >= previous_raw:
+                if previous_cap and previous_raw <= previous_cap * MAX_RAW_OVER_LEVEL_CAP_RATIO:
                     remaining = max(0, int(round(previous_cap - previous_raw)))
                     self.total_gained += remaining + raw
                     self._level_ups += 1
                     self._advance_manual_level()
+                    sample_cap = self._sample_level_cap(raw, pct)
                     self.status.config(
                         text=f"偵測到升級，已補算升級前剩餘 {remaining:,} EXP"
                     )
@@ -4283,12 +4862,16 @@ OCR 診斷
                     return False
             elif delta < 0:
                 self._clear_pending_jump()
-                self._ignored_samples += 1
-                self.status.config(text="已忽略一次不可信 OCR：經驗值回退")
-                self._last_ocr_text = (
-                    f"{self._last_ocr_text}；同一等級 EXP 不應低於上一筆可信值 {previous_raw:,}，忽略 {raw:,}"
-                )
-                return False
+                self._clear_pending_level_reset()
+                if self._should_accept_backward_correction(previous_raw, previous_pct, raw, pct, visual_pct):
+                    self._accept_backward_correction(raw, pct, previous_raw)
+                else:
+                    self._ignored_samples += 1
+                    self.status.config(text="已忽略一次不可信 OCR：經驗值回退")
+                    self._last_ocr_text = (
+                        f"{self._last_ocr_text}；同一等級 EXP 不應低於上一筆可信值 {previous_raw:,}，忽略 {raw:,}"
+                    )
+                    return False
 
         if raw is not None:
             self._last_raw = raw
@@ -4395,7 +4978,26 @@ OCR 診斷
         self._level_estimate_error = None
         return level_cap_from_sample(raw, pct)
 
+    def _pending_level_reset_next_level(self):
+        if self._pending_level_reset_raw is None:
+            return None
+        current_level = self._manual_level or self._estimated_level
+        if current_level is None:
+            return None
+        return self._valid_manual_level(current_level + 1)
+
+    def _current_exp_display_text(self):
+        if self._pending_level_reset_raw is not None:
+            return exp_display_grouped(self._pending_level_reset_raw, self._pending_level_reset_pct)
+        if self.samples:
+            _t, _gained, raw, pct = self.samples[-1]
+            return exp_display_grouped(raw, pct)
+        return None
+
     def _level_display_text(self):
+        pending_level = self._pending_level_reset_next_level()
+        if pending_level is not None:
+            return f"Lv {pending_level}（確認中）"
         if self._manual_level is not None:
             return f"Lv {self._manual_level}（校正）"
         if self._estimated_level is None:
@@ -4403,6 +5005,8 @@ OCR 診斷
         return f"Lv {self._estimated_level}"
 
     def _level_eta_text(self, rate=None):
+        if self._pending_level_reset_raw is not None:
+            return "升級確認中"
         if not self.samples or self._last_raw is None:
             return "—"
         if self._last_pct is None:
@@ -4442,10 +5046,7 @@ OCR 診斷
         if not hasattr(self, "compact_rate_lbl"):
             return
         rate_text, eta5_text, _eta10_text, eta30_text, level_eta_text = self._rate_display_values()
-        current_text = "—"
-        if self.samples:
-            _t, _gained, raw, pct = self.samples[-1]
-            current_text = exp_display_grouped(raw, pct)
+        current_text = self._current_exp_display_text() or "—"
         self.compact_current_lbl.config(text=current_text)
         self.compact_rate_lbl.config(text=rate_text)
         self.compact_eta5_lbl.config(text=eta5_text)
@@ -4453,9 +5054,9 @@ OCR 診斷
         self.compact_level_lbl.config(text=level_eta_text)
 
     def _tick_ui(self):
-        if self.samples:
-            _, _, raw, pct = self.samples[-1]
-            self.cur_lbl.config(text=f"目前 EXP：{exp_display_grouped(raw, pct)}")
+        current_text = self._current_exp_display_text()
+        if current_text is not None:
+            self.cur_lbl.config(text=f"目前 EXP：{current_text}")
 
         if self.session_start:
             elapsed = time.time() - self.session_start
@@ -4500,7 +5101,8 @@ OCR 診斷
         text = " ".join((self._last_ocr_text or "").split())
         if not text:
             text = "—"
-        self.ocr_text_lbl.config(text=f"最後讀取：{text}", wraplength=diag_width)
+        state = self._last_ocr_state or "待命"
+        self.ocr_text_lbl.config(text=f"最後讀取（{state}）：{text}", wraplength=diag_width)
 
 
 def main():
