@@ -48,7 +48,7 @@ except ImportError:
     pwc = None
 
 
-APP_VERSION = "v2026.05.11.002"
+APP_VERSION = "v2026.05.16.001"
 APP_NAME = "MapleStar EXP Tracker"
 APP_TITLE = f"MapleStar EXP Tracker {APP_VERSION}"
 APP_AUTHOR = "作者 by 胖胖布丁小紅"
@@ -4241,6 +4241,69 @@ OCR 診斷
         )
         return corrected
 
+    def _correct_leading_digit_by_manual_level_pct(self, raw, pct, visual_pct=None):
+        if self._manual_level is None or raw is None:
+            return raw
+        raw_digits = str(raw)
+        if len(raw_digits) < 2:
+            return raw
+
+        reference_cap = float(MAPLESTAR_EXP_BY_LEVEL[self._manual_level])
+        pct_candidates = self._correction_progress_pct_candidates(pct, visual_pct)
+        if not pct_candidates:
+            return raw
+
+        tolerance = max(MIN_DELTA_TOLERANCE, reference_cap * PROGRESS_RAW_TOLERANCE_RATIO)
+        min_improvement = max(MIN_DELTA_TOLERANCE / 4, reference_cap * CONFUSED_DIGIT_CORRECTION_RATIO)
+        candidates = []
+
+        for pct_priority, reference_pct in pct_candidates:
+            expected_raw = reference_cap * (reference_pct / 100)
+            expected_digits = str(max(0, int(round(expected_raw))))
+            if len(expected_digits) != len(raw_digits):
+                continue
+            if raw_digits[0] == expected_digits[0]:
+                continue
+
+            candidate = int(f"{expected_digits[0]}{raw_digits[1:]}")
+            if candidate > reference_cap * MAX_RAW_OVER_LEVEL_CAP_RATIO:
+                continue
+            if (
+                self._last_raw is not None
+                and candidate < self._last_raw
+                and not self._is_confirmed_level_reset(self._last_raw, self._last_pct, candidate, pct, visual_pct)
+            ):
+                continue
+
+            current_distance = abs(raw - expected_raw)
+            candidate_distance = abs(candidate - expected_raw)
+            improvement = current_distance - candidate_distance
+            if improvement < min_improvement:
+                continue
+            if candidate_distance > tolerance:
+                continue
+            candidates.append((
+                candidate_distance,
+                -improvement,
+                pct_priority,
+                candidate,
+                raw_digits[0],
+                expected_digits[0],
+                reference_pct,
+            ))
+
+        if not candidates:
+            return raw
+
+        _distance, _improvement, _pct_priority, corrected, old, new, reference_pct = min(
+            candidates,
+            key=lambda item: (item[2], item[0], item[1]),
+        )
+        self._last_ocr_text = (
+            f"{self._last_ocr_text}；依校正 Lv {self._manual_level} 與 {reference_pct:.2f}% 修正首位 {old}->{new}：{corrected:,}"
+        )
+        return corrected
+
     def _correct_8_to_9_by_context(self, raw, pct):
         if raw is None or pct is None or self._level_cap is None:
             return raw
@@ -4579,6 +4642,7 @@ OCR 診斷
         raw = self._correct_confused_digits_by_context(raw, pct, visual_pct)
         pct = self._correct_pct_by_manual_level_and_step(raw, pct, visual_pct)
         raw = self._correct_missing_prefix_by_manual_level_pct(raw, pct, visual_pct)
+        raw = self._correct_leading_digit_by_manual_level_pct(raw, pct, visual_pct)
         raw = self._correct_inserted_digit_by_level_cap(raw, pct, visual_pct)
         raw = self._correct_confused_digits_by_context(raw, pct, visual_pct)
         pct = self._correct_pct_by_manual_level_and_step(raw, pct, visual_pct)
@@ -4696,6 +4760,7 @@ OCR 診斷
         raw = self._correct_confused_digits_by_context(raw, pct, visual_pct)
         pct = self._correct_pct_by_manual_level_and_step(raw, pct, visual_pct)
         raw = self._correct_missing_prefix_by_manual_level_pct(raw, pct, visual_pct)
+        raw = self._correct_leading_digit_by_manual_level_pct(raw, pct, visual_pct)
         raw = self._correct_inserted_digit_by_level_cap(raw, pct, visual_pct)
         raw = self._correct_confused_digits_by_context(raw, pct, visual_pct)
         pct = self._correct_pct_by_manual_level_and_step(raw, pct, visual_pct)
