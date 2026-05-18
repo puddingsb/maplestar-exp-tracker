@@ -15,6 +15,7 @@ import json
 import math
 import os
 import re
+import shutil
 import sys
 import threading
 import time
@@ -48,7 +49,7 @@ except ImportError:
     pwc = None
 
 
-APP_VERSION = "v2026.05.16.001"
+APP_VERSION = "v2026.05.18.001"
 APP_NAME = "MapleStar EXP Tracker"
 APP_TITLE = f"MapleStar EXP Tracker {APP_VERSION}"
 APP_AUTHOR = "作者 by 胖胖布丁小紅"
@@ -167,11 +168,103 @@ def app_data_dir():
 OCR_DEBUG_DIR = app_data_dir() / "ocr_debug"
 SETTINGS_PATH = app_data_dir() / "settings.json"
 APP_ICON_PATH = ("assets", "app_icon.png")
+PADDLEX_MODEL_REQUIRED_FILES = (
+    "config.json",
+    "inference.json",
+    "inference.pdiparams",
+    "inference.yml",
+)
 
 
 def bundled_resource_path(*parts):
     base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
     return base.joinpath(*parts)
+
+
+def path_is_ascii(path):
+    try:
+        str(path).encode("ascii")
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
+def model_dir_is_usable(path):
+    path = Path(path)
+    if not path.exists() or not path.is_dir():
+        return False
+    for filename in PADDLEX_MODEL_REQUIRED_FILES:
+        file_path = path / filename
+        if not file_path.exists() or not file_path.is_file():
+            return False
+        try:
+            if file_path.stat().st_size <= 0:
+                return False
+        except OSError:
+            return False
+    return True
+
+
+def ascii_model_cache_root():
+    candidates = []
+    if platform.system() == "Windows":
+        program_data = os.environ.get("PROGRAMDATA") or r"C:\ProgramData"
+        public_dir = os.environ.get("PUBLIC") or r"C:\Users\Public"
+        candidates.extend(
+            [
+                Path(program_data) / "MapleStar-EXP-Tracker" / "paddlex_models",
+                Path(public_dir) / "MapleStar-EXP-Tracker" / "paddlex_models",
+            ]
+        )
+    candidates.append(app_data_dir() / "paddlex_models")
+
+    for candidate in candidates:
+        if not path_is_ascii(candidate):
+            continue
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            return candidate
+        except OSError:
+            continue
+    fallback = app_data_dir() / "paddlex_models"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+
+def path_is_relative_to(path, parent):
+    try:
+        Path(path).resolve().relative_to(Path(parent).resolve())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def prepare_paddlex_model_dir(source, model_name):
+    source = Path(source)
+    if not model_dir_is_usable(source):
+        return None
+
+    bundled_root = getattr(sys, "_MEIPASS", None)
+    source_is_bundled = bundled_root is not None and path_is_relative_to(source, bundled_root)
+    if path_is_ascii(source) and not source_is_bundled:
+        return str(source)
+
+    target = ascii_model_cache_root() / model_name
+    if model_dir_is_usable(target):
+        return str(target)
+
+    try:
+        if target.exists():
+            shutil.rmtree(target)
+        shutil.copytree(source, target, ignore=shutil.ignore_patterns(".cache", "__pycache__"))
+    except OSError:
+        if path_is_ascii(source):
+            return str(source)
+        return None
+
+    if model_dir_is_usable(target):
+        return str(target)
+    return str(source) if path_is_ascii(source) else None
 
 
 def set_app_icon(window):
@@ -1163,11 +1256,13 @@ PP_OCR_MODELS = (
 
 def _paddlex_model_dir(model_name):
     bundled = bundled_resource_path("paddlex_models", model_name)
-    if bundled.exists():
-        return str(bundled)
+    prepared = prepare_paddlex_model_dir(bundled, model_name)
+    if prepared:
+        return prepared
     cached = Path.home() / ".paddlex" / "official_models" / model_name
-    if cached.exists():
-        return str(cached)
+    prepared = prepare_paddlex_model_dir(cached, model_name)
+    if prepared:
+        return prepared
     return None
 
 
@@ -1206,6 +1301,10 @@ def _pp_ocr_engine():
             model_dir = _paddlex_model_dir(model_name)
             if model_dir:
                 kwargs[key] = model_dir
+            else:
+                raise RuntimeError(
+                    f"找不到完整的 {model_name} 模型檔。請重新下載最新版，或刪除損壞的 .paddlex 快取後重試。"
+                )
         _PP_OCR_DEVICE_STATUS = f"CPU（PP-OCRv5 / PaddleOCR，{_ocr_cpu_threads()} 執行緒）"
         _PP_OCR_ENGINE = PaddleOCR(**kwargs)
         _PP_OCR_ERROR = None
