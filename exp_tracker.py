@@ -49,7 +49,7 @@ except ImportError:
     pwc = None
 
 
-APP_VERSION = "v2026.05.18.001"
+APP_VERSION = "v2026.05.25.001"
 APP_NAME = "MapleStar EXP Tracker"
 APP_TITLE = f"MapleStar EXP Tracker {APP_VERSION}"
 APP_AUTHOR = "作者 by 胖胖布丁小紅"
@@ -69,6 +69,7 @@ CAP_TOLERANCE_RATIO = 0.0005
 BACKWARD_CORRECTION_CAP_RATIO = 0.003
 CONFUSED_DIGIT_CORRECTION_RATIO = 0.001
 CONFUSED_EXP_DIGITS = "689"
+OCR_PCT_STABLE_RAW_RATIO = 0.005
 PROGRESS_RAW_TOLERANCE_RATIO = 0.025
 MAX_RAW_OVER_LEVEL_CAP_RATIO = 1.02
 PCT_VISUAL_MISMATCH_TOLERANCE = 2.5
@@ -4245,6 +4246,23 @@ OCR 診斷
             expected.append(self._last_raw)
         return expected
 
+    def _raw_is_stable_for_ocr_pct(self, raw, pct, reference_cap):
+        if raw is None or pct is None or reference_cap is None:
+            return False
+        if reference_cap <= 0 or not 0 <= pct <= 100:
+            return False
+        expected_raw = reference_cap * (pct / 100)
+        tolerance = max(MIN_DELTA_TOLERANCE, reference_cap * OCR_PCT_STABLE_RAW_RATIO)
+        return abs(raw - expected_raw) <= tolerance
+
+    def _sample_matches_current_progress(self, raw, pct, visual_pct=None, reference_cap=None):
+        cap = reference_cap or self._level_cap
+        if self._manual_level is not None:
+            cap = float(MAPLESTAR_EXP_BY_LEVEL[self._manual_level])
+        if not self._raw_is_stable_for_ocr_pct(raw, pct, cap):
+            return False
+        return self._observed_pct_is_supported(pct, visual_pct)
+
     def _correct_confused_digits_by_context(self, raw, pct, visual_pct=None):
         if raw is None or self._level_cap is None:
             return raw
@@ -4258,6 +4276,9 @@ OCR 診斷
         if self._manual_level is not None:
             reference_cap = float(MAPLESTAR_EXP_BY_LEVEL[self._manual_level])
         if reference_cap is None:
+            return raw
+
+        if self._raw_is_stable_for_ocr_pct(raw, pct, reference_cap):
             return raw
 
         pct_candidates = self._correction_progress_pct_candidates(pct, visual_pct)
@@ -4348,6 +4369,9 @@ OCR 診斷
             return raw
 
         reference_cap = float(MAPLESTAR_EXP_BY_LEVEL[self._manual_level])
+        if self._raw_is_stable_for_ocr_pct(raw, pct, reference_cap):
+            return raw
+
         pct_candidates = self._correction_progress_pct_candidates(pct, visual_pct)
         if not pct_candidates:
             return raw
@@ -4949,16 +4973,24 @@ OCR 診斷
             # with the delta implied by the percentage, so the rule scales from
             # millions to billions instead of using a fixed EXP cap.
             reference_cap = self._level_cap or self._sample_level_cap(previous_raw, previous_pct)
+            current_matches_progress = self._sample_matches_current_progress(raw, pct, visual_pct, reference_cap)
             expected_delta = expected_delta_from_percent(reference_cap, pct_delta)
             tolerance = delta_tolerance(reference_cap, expected_delta)
             suspicious_jump = (
                 delta > 0
+                and not current_matches_progress
                 and expected_delta is not None
                 and delta > expected_delta + tolerance
             )
-            suspicious_flat_pct = delta > 0 and pct_delta is not None and pct_delta <= 0.01 and delta > MIN_DELTA_TOLERANCE
+            suspicious_flat_pct = (
+                delta > 0
+                and not current_matches_progress
+                and pct_delta is not None
+                and pct_delta <= 0.01
+                and delta > MIN_DELTA_TOLERANCE
+            )
             suspicious_cap = cap_ratio is not None and cap_ratio > MAX_LEVEL_CAP_RATIO_JUMP
-            suspicious_pct = delta > 0 and pct_delta is not None and pct_delta < 0
+            suspicious_pct = delta > 0 and not current_matches_progress and pct_delta is not None and pct_delta < 0
             suspicious = suspicious_jump or suspicious_flat_pct or suspicious_cap or suspicious_pct
 
             if delta > 0 and not suspicious:
@@ -5058,7 +5090,7 @@ OCR 診斷
     def _rate_per_min(self, window_s: float):
         if len(self.samples) < 2:
             return None
-        now = self.samples[-1][0]
+        now = time.time()
         cutoff = now - window_s
         window_samples = []
         previous = None
