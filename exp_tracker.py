@@ -27,6 +27,11 @@ from tkinter import messagebox, simpledialog, ttk
 
 import mss
 from PIL import Image, ImageFilter, ImageOps, ImageTk
+from tracker.corrector import CorrectionContext, apply_pipeline
+from tracker.level_ocr import LEVEL_OCR_INTERVAL_TICKS, LEVEL_OCR_STABLE_VOTES, recognize_level
+from tracker.rate import RateView
+from tracker.state import PendingState
+from tracker.status import OCRResult, SampleStatus
 
 os.environ.setdefault("DISABLE_MODEL_SOURCE_CHECK", "True")
 os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
@@ -49,10 +54,11 @@ except ImportError:
     pwc = None
 
 
-APP_VERSION = "v2026.05.25.001"
+APP_VERSION = "v2026.05.27.005"
 APP_NAME = "MapleStar EXP Tracker"
 APP_TITLE = f"MapleStar EXP Tracker {APP_VERSION}"
 APP_AUTHOR = "作者 by 胖胖布丁小紅"
+CRASH_LOG_PATH = Path(os.environ.get("TEMP") or os.environ.get("TMP") or ".") / "maplestar_exp_tracker_crash.log"
 SAMPLE_INTERVAL_OPTIONS = (1, 2, 3, 5, 10)
 DEFAULT_SAMPLE_INTERVAL = 1
 SAMPLE_INTERVAL = float(DEFAULT_SAMPLE_INTERVAL)
@@ -164,6 +170,15 @@ def app_data_dir():
     else:
         base = Path.home() / ".local" / "share"
     return base / "MapleStar-EXP-Tracker"
+
+
+def _write_crash_log(message):
+    try:
+        CRASH_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with CRASH_LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(message.rstrip() + "\n")
+    except Exception:
+        pass
 
 
 OCR_DEBUG_DIR = app_data_dir() / "ocr_debug"
@@ -2386,25 +2401,30 @@ class ExpTracker:
             self._settings.get("last_digit_count"),
         )
         self._manual_level = self._load_manual_level()
+        self._level_source = self._settings.get("level_source", "manual") if self._manual_level is not None else None
         self.exp_offset = None  # (x, y, w, h) relative to window's top-left
         self.samples = deque()
+        self.rate_view = RateView(
+            self.samples,
+            lambda: self.total_gained,
+            min_delta_tolerance=MIN_DELTA_TOLERANCE,
+            outlier_min_positive_segments=RATE_OUTLIER_MIN_POSITIVE_SEGMENTS,
+            outlier_multiplier=RATE_OUTLIER_MULTIPLIER,
+            outlier_mad_multiplier=RATE_OUTLIER_MAD_MULTIPLIER,
+        )
         self.total_gained = 0
+        self.level_offset = None
+        self._level_ocr_votes = deque(maxlen=LEVEL_OCR_STABLE_VOTES)
+        self._level_ocr_tick = 0
+        self._level_ocr_last = None
+        self._level_ocr_text = ""
+        self._level_ocr_state = "未設定"
+        self._level_ocr_at = None
         self._last_raw = None
         self._last_pct = None
         self._estimated_level = None
         self._level_estimate_error = None
-        self._pending_raw = None
-        self._pending_pct = None
-        self._pending_at = None
-        self._pending_jump_raw = None
-        self._pending_jump_pct = None
-        self._pending_jump_at = None
-        self._pending_level_reset_raw = None
-        self._pending_level_reset_pct = None
-        self._pending_level_reset_previous_raw = None
-        self._pending_level_reset_previous_pct = None
-        self._pending_level_reset_at = None
-        self._pending_level_reset_count = 0
+        self._pending = PendingState()
         self._manual_exp_floor_raw = None
         self._manual_exp_floor_level = None
         self._level_cap = None
@@ -2420,10 +2440,15 @@ class ExpTracker:
         self._last_ocr_text = ""
         self._last_ocr_state = ""
         self._last_ocr_at = None
+        self._last_ocr_result = OCRResult()
+        self._last_sample_status = SampleStatus()
         self._last_error = ""
         self.session_start = None
+        self._paused_duration = 0.0
+        self._pause_started_at = None
         self.running = False
         self._compact_mode = False
+        self._compact_opacity = self._valid_compact_opacity(self._settings.get("compact_opacity", 1.0))
         self._full_geometry = None
         self._geometry_save_after = None
         self._restoring_geometry = False
@@ -2435,6 +2460,102 @@ class ExpTracker:
         self.root.bind("<Configure>", self._on_root_configure)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._refresh_windows()
+
+    @property
+    def _pending_raw(self):
+        return self._pending.baseline_raw
+
+    @_pending_raw.setter
+    def _pending_raw(self, value):
+        self._pending.baseline_raw = value
+
+    @property
+    def _pending_pct(self):
+        return self._pending.baseline_pct
+
+    @_pending_pct.setter
+    def _pending_pct(self, value):
+        self._pending.baseline_pct = value
+
+    @property
+    def _pending_at(self):
+        return self._pending.baseline_at
+
+    @_pending_at.setter
+    def _pending_at(self, value):
+        self._pending.baseline_at = value
+
+    @property
+    def _pending_jump_raw(self):
+        return self._pending.jump_raw
+
+    @_pending_jump_raw.setter
+    def _pending_jump_raw(self, value):
+        self._pending.jump_raw = value
+
+    @property
+    def _pending_jump_pct(self):
+        return self._pending.jump_pct
+
+    @_pending_jump_pct.setter
+    def _pending_jump_pct(self, value):
+        self._pending.jump_pct = value
+
+    @property
+    def _pending_jump_at(self):
+        return self._pending.jump_at
+
+    @_pending_jump_at.setter
+    def _pending_jump_at(self, value):
+        self._pending.jump_at = value
+
+    @property
+    def _pending_level_reset_raw(self):
+        return self._pending.level_reset_raw
+
+    @_pending_level_reset_raw.setter
+    def _pending_level_reset_raw(self, value):
+        self._pending.level_reset_raw = value
+
+    @property
+    def _pending_level_reset_pct(self):
+        return self._pending.level_reset_pct
+
+    @_pending_level_reset_pct.setter
+    def _pending_level_reset_pct(self, value):
+        self._pending.level_reset_pct = value
+
+    @property
+    def _pending_level_reset_previous_raw(self):
+        return self._pending.level_reset_previous_raw
+
+    @_pending_level_reset_previous_raw.setter
+    def _pending_level_reset_previous_raw(self, value):
+        self._pending.level_reset_previous_raw = value
+
+    @property
+    def _pending_level_reset_previous_pct(self):
+        return self._pending.level_reset_previous_pct
+
+    @_pending_level_reset_previous_pct.setter
+    def _pending_level_reset_previous_pct(self, value):
+        self._pending.level_reset_previous_pct = value
+
+    @property
+    def _pending_level_reset_at(self):
+        return self._pending.level_reset_at
+
+    @_pending_level_reset_at.setter
+    def _pending_level_reset_at(self, value):
+        self._pending.level_reset_at = value
+
+    @property
+    def _pending_level_reset_count(self):
+        return self._pending.level_reset_count
+
+    @_pending_level_reset_count.setter
+    def _pending_level_reset_count(self, value):
+        self._pending.level_reset_count = int(value or 0)
 
     def _build_ui(self):
         self._setup_style()
@@ -2520,52 +2641,29 @@ class ExpTracker:
 
         row2 = tk.Frame(target, bg=c["panel"])
         row2.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(12, 0))
-        RoundedButton(
-            row2,
-            text="框選 EXP 區域",
-            command=self._use_window,
-            bg=c["panel"],
-            fill=c["accent_dark"],
-            active_fill="#0F8A5D",
-            width=150,
-        ).pack(side="left")
-        RoundedButton(
-            row2,
-            text="重新框選",
-            command=self._use_window,
-            bg=c["panel"],
-            fill=c["button"],
-            active_fill="#293548",
-            width=116,
-        ).pack(side="left", padx=(8, 0))
-        RoundedButton(
-            row2,
-            text="校正目前 EXP",
-            command=self._calibrate_digits,
-            bg=c["panel"],
-            fill=c["button"],
-            active_fill="#293548",
-            width=132,
-        ).pack(side="left", padx=(8, 0))
-        RoundedButton(
-            row2,
-            text="校正等級",
-            command=self._calibrate_level,
-            bg=c["panel"],
-            fill=c["button"],
-            active_fill="#293548",
-            width=104,
-        ).pack(side="left", padx=(8, 0))
-        RoundedButton(
-            row2,
-            text="清除設定",
-            command=self._clear_settings,
-            bg=c["panel"],
-            fill="#7F1D1D",
-            fg="#FFFFFF",
-            active_fill="#B91C1C",
-            width=116,
-        ).pack(side="left", padx=(8, 0))
+        for col in range(3):
+            row2.columnconfigure(col, weight=1, uniform="target_actions")
+        action_buttons = (
+            ("框選 EXP 區域", self._use_window, c["accent_dark"], c["fg"], "#0F8A5D"),
+            ("重新框選", self._use_window, c["button"], c["fg"], "#293548"),
+            ("校正目前 EXP", self._calibrate_digits, c["button"], c["fg"], "#293548"),
+            ("校正等級", self._calibrate_level, c["button"], c["fg"], "#293548"),
+            ("框選等級", self._use_window_for_level, c["button"], c["fg"], "#293548"),
+            ("清除設定", self._clear_settings, "#7F1D1D", "#FFFFFF", "#B91C1C"),
+        )
+        for idx, (text, command, fill, fg, active_fill) in enumerate(action_buttons):
+            btn = RoundedButton(
+                row2,
+                text=text,
+                command=command,
+                bg=c["panel"],
+                fill=fill,
+                fg=fg,
+                active_fill=active_fill,
+                width=148,
+                height=36,
+            )
+            btn.grid(row=idx // 3, column=idx % 3, sticky="ew", padx=(0 if idx % 3 == 0 else 8, 0), pady=(0 if idx < 3 else 8, 0))
 
         tk.Label(
             target,
@@ -2595,9 +2693,17 @@ class ExpTracker:
 
         self.region_lbl = tk.Label(target, text="尚未設定 EXP 區域", bg=c["panel"], fg=c["muted_text"], font=("Microsoft JhengHei UI", 9))
         self.region_lbl.grid(row=6, column=0, columnspan=3, sticky="w", pady=(14, 0))
+        self.level_region_lbl = tk.Label(
+            target,
+            text="尚未設定等級區域（可選）",
+            bg=c["panel"],
+            fg=c["muted_text"],
+            font=("Microsoft JhengHei UI", 9),
+        )
+        self.level_region_lbl.grid(row=7, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         bar = tk.Frame(target, bg=c["panel"])
-        bar.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(14, 0))
+        bar.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(14, 0))
         self.start_btn = RoundedButton(
             bar,
             text="開始追蹤",
@@ -2742,6 +2848,7 @@ class ExpTracker:
         c = self.colors
         frame = tk.Frame(self.root, bg=c["bg"], padx=14, pady=14)
         self.compact_frame = frame
+        frame.bind("<Button-3>", self._show_compact_context_menu)
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(1, weight=1)
 
@@ -2768,6 +2875,7 @@ class ExpTracker:
 
         panel = RoundedPanel(frame, bg=c["bg"], fill=c["panel"], border=c["border"], radius=18, padding=12)
         panel.grid(row=1, column=0, sticky="nsew")
+        panel.content.bind("<Button-3>", self._show_compact_context_menu)
         body = panel.content
         body.columnconfigure(1, weight=1)
         self.compact_current_lbl = self._compact_metric(body, "目前 EXP", "—", 0)
@@ -2806,6 +2914,7 @@ class ExpTracker:
         self._full_geometry = self._settings.get("full_geometry") or self.root.geometry()
         self.main_frame.pack_forget()
         self.root.attributes("-topmost", True)
+        self.root.attributes("-alpha", self._compact_opacity)
         self.root.minsize(380, 270)
         self._apply_saved_geometry("compact", fallback="430x310")
         self.compact_frame.pack(fill="both", expand=True)
@@ -2819,9 +2928,46 @@ class ExpTracker:
         if self.compact_frame:
             self.compact_frame.pack_forget()
         self.root.attributes("-topmost", False)
+        self.root.attributes("-alpha", 1.0)
         self.root.minsize(980, 820)
         self.main_frame.pack(fill="both", expand=True)
         self._apply_saved_geometry("full", fallback=self._full_geometry or "1020x880")
+
+    def _valid_compact_opacity(self, value):
+        try:
+            opacity = float(value)
+        except (TypeError, ValueError):
+            return 1.0
+        return max(0.55, min(1.0, opacity))
+
+    def _set_compact_opacity(self, opacity):
+        self._compact_opacity = self._valid_compact_opacity(opacity)
+        self._settings["compact_opacity"] = self._compact_opacity
+        self._save_settings()
+        if self._compact_mode:
+            self.root.attributes("-alpha", self._compact_opacity)
+
+    def _show_compact_context_menu(self, event):
+        if not self._compact_mode:
+            return
+        menu = tk.Menu(self.root, tearoff=False)
+        for label, opacity in (("100%", 1.0), ("90%", 0.9), ("80%", 0.8), ("70%", 0.7)):
+            menu.add_command(label=label, command=lambda value=opacity: self._set_compact_opacity(value))
+        menu.add_separator()
+        for label, geometry in (("小尺寸", "380x270"), ("中尺寸", "430x310"), ("大尺寸", "520x370")):
+            menu.add_command(label=label, command=lambda value=geometry: self._set_compact_size(value))
+        menu.add_separator()
+        menu.add_command(label="完整視窗", command=self._show_full_window)
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _set_compact_size(self, geometry):
+        if not self._compact_mode:
+            return
+        geometry = self._valid_geometry(geometry)
+        if geometry is None:
+            return
+        self.root.geometry(geometry)
+        self.root.after(50, lambda: self._save_current_geometry("compact"))
 
     def _valid_geometry(self, geometry):
         if not isinstance(geometry, str):
@@ -2992,12 +3138,16 @@ class ExpTracker:
     def _load_manual_level(self):
         return self._valid_manual_level(self._settings.get("manual_level"))
 
-    def _set_manual_level(self, level):
+    def _set_manual_level(self, level, source="manual"):
         self._manual_level = self._valid_manual_level(level)
         if self._manual_level is None:
             self._settings.pop("manual_level", None)
+            self._settings.pop("level_source", None)
+            self._level_source = None
         else:
             self._settings["manual_level"] = self._manual_level
+            self._settings["level_source"] = source
+            self._level_source = source
         self._save_settings()
         if self._manual_level is not None:
             self._estimated_level = self._manual_level
@@ -3013,6 +3163,8 @@ class ExpTracker:
             return
         self._manual_level = next_level
         self._settings["manual_level"] = next_level
+        if self._level_source:
+            self._settings["level_source"] = self._level_source
         self._save_settings()
         self._estimated_level = next_level
         self._level_estimate_error = 0.0
@@ -3059,10 +3211,11 @@ class ExpTracker:
             "確定要清除所有設定資料嗎？\n\n"
             "這會刪除：\n"
             "- 已記住的視窗與 EXP 框選位置\n"
+            "- 已記住的等級 OCR 框選位置\n"
             "- 已記住的手動校正資料\n"
             "- 已記住的目前等級校正\n"
             "- 已記住的更新頻率\n"
-            "- 已記住的完整視窗與精簡視窗大小\n\n"
+            "- 已記住的完整視窗與精簡視窗大小/透明度\n\n"
             "本次累積與目前追蹤狀態也會重置。",
             icon="warning",
             parent=self.root,
@@ -3073,12 +3226,20 @@ class ExpTracker:
         self.stop()
         self._settings = {"regions": {}}
         self.sample_interval = DEFAULT_SAMPLE_INTERVAL
+        self._compact_opacity = 1.0
         self._manual_level = None
+        self._level_source = None
         self._refresh_interval_buttons()
         self._refresh_level_label()
         _set_digit_templates({}, {})
         _set_manual_digit_calibration(None, None)
         self.exp_offset = None
+        self.level_offset = None
+        self._level_ocr_votes.clear()
+        self._level_ocr_last = None
+        self._level_ocr_text = ""
+        self._level_ocr_state = "未設定"
+        self._level_ocr_at = None
         self.window_obj = None
         self._win_size = None
         self._selected_window_key = None
@@ -3091,6 +3252,7 @@ class ExpTracker:
 
         self.reset()
         self.region_lbl.config(text="尚未設定 EXP 區域", foreground=self.colors["muted_text"])
+        self.level_region_lbl.config(text="尚未設定等級區域（可選）", foreground=self.colors["muted_text"])
         self.start_btn.config(state="disabled")
         self.status.config(text="已清除設定資料，請重新選擇視窗、框選 EXP 區域並校正目前 EXP")
         messagebox.showinfo("清除完成", "設定資料已清除。", parent=self.root)
@@ -3102,6 +3264,15 @@ class ExpTracker:
             return region
         if "Maple" in (title or "") or "楓" in (title or ""):
             return validate_region(self._settings.get("last_region"), win)
+        return None
+
+    def _saved_level_region_for_window(self, title, win):
+        regions = self._settings.get("level_regions", {})
+        region = validate_region(regions.get(window_region_key(title)), win)
+        if region is not None:
+            return region
+        if "Maple" in (title or "") or "楓" in (title or ""):
+            return validate_region(self._settings.get("last_level_region"), win)
         return None
 
     def _apply_region(self, region, saved=False):
@@ -3118,6 +3289,20 @@ class ExpTracker:
         self.start_btn.config(state="normal")
         return True
 
+    def _apply_level_region(self, region, saved=False):
+        region = validate_region(region, self.window_obj)
+        if not region:
+            return False
+        self.level_offset = region
+        x, y, w, h = region
+        prefix = "已載入上次等級區域" if saved else "等級區域"
+        if hasattr(self, "level_region_lbl"):
+            self.level_region_lbl.config(
+                text=f"{prefix}：{w}×{h} @ ({x}, {y}) (相對視窗)",
+                foreground=self.colors["accent"],
+            )
+        return True
+
     def _save_region_for_selected_window(self):
         idx = self.win_combo.current()
         if idx < 0 or idx >= len(getattr(self, "_wins", [])) or not self.exp_offset:
@@ -3127,6 +3312,16 @@ class ExpTracker:
         self._settings.setdefault("regions", {})[window_region_key(title)] = region
         self._settings["last_region"] = region
         self._settings["last_window_title"] = title
+        self._save_settings()
+
+    def _save_level_region_for_selected_window(self):
+        idx = self.win_combo.current()
+        if idx < 0 or idx >= len(getattr(self, "_wins", [])) or not self.level_offset:
+            return
+        title, _win = self._wins[idx]
+        region = [int(v) for v in self.level_offset]
+        self._settings.setdefault("level_regions", {})[window_region_key(title)] = region
+        self._settings["last_level_region"] = region
         self._save_settings()
 
     def _apply_saved_region_for_selected_window(self):
@@ -3150,7 +3345,27 @@ class ExpTracker:
             self._win_size = (int(win.width), int(win.height))
         except Exception:
             self._win_size = None
-        return self._apply_region(region, saved=True)
+        applied = self._apply_region(region, saved=True)
+        self._apply_saved_level_region_for_selected_window()
+        return applied
+
+    def _apply_saved_level_region_for_selected_window(self):
+        idx = self.win_combo.current()
+        if idx < 0 or idx >= len(getattr(self, "_wins", [])):
+            return False
+        title, win = self._wins[idx]
+        region = self._saved_level_region_for_window(title, win)
+        if region is None:
+            self.level_offset = None
+            if hasattr(self, "level_region_lbl"):
+                self.level_region_lbl.config(
+                    text="尚未設定等級區域（可選）",
+                    foreground=self.colors["muted_text"],
+                )
+            return False
+        if self.window_obj is None:
+            self.window_obj = win
+        return self._apply_level_region(region, saved=True)
 
     def _refresh_windows(self):
         if pwc is None:
@@ -3185,7 +3400,13 @@ class ExpTracker:
             self.win_combo.current(maple_idx)
         self._remember_selected_window()
         loaded_region = self._apply_saved_region_for_selected_window()
-        suffix = "，已套用上次框選區域" if loaded_region else ""
+        loaded_level_region = self._apply_saved_level_region_for_selected_window()
+        suffix_parts = []
+        if loaded_region:
+            suffix_parts.append("EXP")
+        if loaded_level_region:
+            suffix_parts.append("等級")
+        suffix = f"，已套用上次{'/'.join(suffix_parts)}區域" if suffix_parts else ""
         self.status.config(text=f"已載入 {len(labels)} 個可選擇視窗{suffix}")
 
     def _remember_selected_window(self):
@@ -3199,8 +3420,15 @@ class ExpTracker:
 
     def _on_window_selected(self, _event=None):
         self._remember_selected_window()
-        if self._apply_saved_region_for_selected_window():
-            self.status.config(text="已套用此視窗的上次框選區域")
+        loaded_exp = self._apply_saved_region_for_selected_window()
+        loaded_level = self._apply_saved_level_region_for_selected_window()
+        if loaded_exp or loaded_level:
+            parts = []
+            if loaded_exp:
+                parts.append("EXP")
+            if loaded_level:
+                parts.append("等級")
+            self.status.config(text=f"已套用此視窗的上次{'/'.join(parts)}區域")
 
     def _selected_window(self):
         idx = self.win_combo.current()
@@ -3241,12 +3469,39 @@ class ExpTracker:
         self.status.config(text=f"已選取：{(win.title or '')}")
         RegionPicker(self.root, img, self._on_region, self.colors)
 
+    def _use_window_for_level(self):
+        win = self._selected_window()
+        if not win:
+            messagebox.showwarning("提示", "請先選擇一個視窗")
+            return
+        try:
+            img, box = self._capture_window_image(win)
+        except Exception as e:
+            messagebox.showerror("擷取失敗", f"無法擷取此視窗：{e}")
+            return
+        self._remember_selected_window()
+        self.window_obj = win
+        self._win_size = (box["width"], box["height"])
+        self.status.config(text="請框選角色等級文字，例如 Lv 158；此步驟可選")
+        RegionPicker(self.root, img, self._on_level_region, self.colors)
+
     def _on_region(self, region):
         if not region:
             return
         if self._apply_region(region, saved=False):
             self._save_region_for_selected_window()
             self.status.config(text="已儲存框選區域，下次會自動套用")
+
+    def _on_level_region(self, region):
+        if not region:
+            return
+        if self._apply_level_region(region, saved=False):
+            self._save_level_region_for_selected_window()
+            self._level_ocr_votes.clear()
+            self._level_ocr_state = "等待追蹤"
+            self._level_ocr_text = ""
+            self._level_ocr_at = None
+            self.status.config(text="已儲存等級 OCR 區域；追蹤時連續辨識穩定後會自動校正等級")
 
     def _show_help(self):
         c = self.colors
@@ -3310,10 +3565,11 @@ class ExpTracker:
 1. 先開啟遊戲，讓 EXP 條完整顯示在畫面上。
 2. 在「擷取來源」選擇 MapleStory 視窗。
 3. 按「框選 EXP 區域」，只框住 EXP 條與右側經驗值數字，不要框到 HP、MP 或其他 UI。
-4. 依需要選擇「更新頻率」，可選每 1、2、3、5、10 秒取樣一次。
-5. 框選後會自動記住位置，下次選到同一個視窗會自動套用。
-6. 若目前 EXP 顯示不正確，可按「校正目前 EXP」手動校正目前值。
-7. 若程式推估等級不符合角色實際等級，可按「校正等級」輸入目前等級。
+4. 可按「框選等級」框住角色等級文字，例如 Lv158；追蹤時連續辨識穩定後會自動校正等級。
+5. 依需要選擇「更新頻率」，可選每 1、2、3、5、10 秒取樣一次。
+6. 框選後會自動記住位置，下次選到同一個視窗會自動套用。
+7. 若目前 EXP 顯示不正確，可按「校正目前 EXP」手動校正目前值。
+8. 若程式推估等級不符合角色實際等級，可按「校正等級」輸入目前等級。
 
 校正目前 EXP
 校準只用來手動校正目前 EXP，不會訓練或切換 OCR。後續辨識固定只使用 PP-OCRv5。
@@ -3336,6 +3592,11 @@ class ExpTracker:
 3. 偵測到升級後，手動校正的等級會自動加 1。
 4. 這不會重置目前 EXP、累積 EXP、時間或效率。
 
+等級 OCR
+1. 按「框選等級」後，框住畫面上的 Lv 數字區域。
+2. 追蹤時程式會低頻率辨識等級，連續 3 次讀到同一等級才套用。
+3. 等級 OCR 只負責校正等級，不會影響目前 EXP 的讀值。
+
 開始追蹤
 1. 校準完成後按「開始追蹤」。
 2. 程式會先等待穩定讀值建立基準，所以剛開始幾秒鐘可能不會立刻顯示累積效率。
@@ -3350,6 +3611,7 @@ class ExpTracker:
 - 本次累積 EXP 也有保護：單次 EXP 跳動過大時，必須同時符合校正等級的經驗表與進度百分比；就算連續高讀，只要和進度不一致也不會加進累積。
 -「依近 5 分鐘預估」會用近 5 分速率推算 5、10、30 分鐘與升級時間；如果剛升級或剛校正，會和「本次累積 EXP ÷ 累計時間」不同。
 7. 精簡追蹤會固定在所有視窗最上層；完整視窗與精簡視窗調整後的大小會分開記住。
+8. 精簡追蹤模式可按右鍵調整透明度。
 
 數字跳動或沒有資料時
 - 先按「停止」，確認遊戲畫面上的 EXP 數字清楚可見。
@@ -3386,6 +3648,69 @@ OCR 診斷
         with mss.mss() as sct:
             shot = sct.grab(region)
             return Image.frombytes("RGB", shot.size, shot.rgb)
+
+    def _capture_level_region(self):
+        win = self.window_obj or self._selected_window()
+        if not win or not self.level_offset:
+            return None
+        try:
+            wx, wy = int(win.left), int(win.top)
+        except Exception:
+            wx, wy = 0, 0
+        ox, oy, ow, oh = self.level_offset
+        region = {"left": wx + ox, "top": wy + oy, "width": ow, "height": oh}
+        with mss.mss() as sct:
+            shot = sct.grab(region)
+            return Image.frombytes("RGB", shot.size, shot.rgb)
+
+    def _submit_level_ocr(self, result):
+        self._level_ocr_at = time.time()
+        if isinstance(result, tuple):
+            level, detail = result
+        else:
+            level, detail = result, ""
+        detail_text = " ".join((detail or "").split()) or "—"
+        self._level_ocr_text = detail_text
+        if level is None:
+            self._level_ocr_state = "未讀到等級"
+            return False
+        level = self._valid_manual_level(level)
+        if level is None:
+            self._level_ocr_state = "讀值超出範圍"
+            return False
+        self._level_ocr_last = level
+        self._level_ocr_votes.append(level)
+        votes = "/".join(str(value) for value in self._level_ocr_votes)
+        if len(self._level_ocr_votes) < LEVEL_OCR_STABLE_VOTES:
+            self._level_ocr_state = f"等待穩定 {len(self._level_ocr_votes)}/{LEVEL_OCR_STABLE_VOTES}"
+            self._level_ocr_text = f"Lv {level}；票數 {votes}；原始 {detail_text}"
+            return False
+        if len(set(self._level_ocr_votes)) != 1:
+            self._level_ocr_state = "讀值不穩定"
+            self._level_ocr_text = f"票數 {votes}；原始 {detail_text}"
+            return False
+        if self._manual_level == level:
+            if self._level_source != "ocr":
+                self._settings["level_source"] = "ocr"
+                self._level_source = "ocr"
+                self._save_settings()
+                self._refresh_level_label()
+                self._level_ocr_state = "已確認來源"
+                self._level_ocr_text = f"Lv {level} 已由 OCR 確認；原始 {detail_text}"
+                self.status.config(text=f"等級 OCR 已確認目前等級 Lv {level}")
+                return True
+            self._level_ocr_state = "穩定但未變更"
+            self._level_ocr_text = f"Lv {level} 與 OCR 一致；原始 {detail_text}"
+            return False
+        previous = self._manual_level
+        self._set_manual_level(level, source="ocr")
+        self._level_ocr_state = "已套用"
+        if previous is None:
+            self._level_ocr_text = f"穩定 Lv {level}，已由 OCR 套用；原始 {detail_text}"
+        else:
+            self._level_ocr_text = f"穩定 Lv {level}，已由 OCR 從 Lv {previous} 更新；原始 {detail_text}"
+        self.status.config(text=f"等級 OCR 已穩定辨識為 Lv {level}，已自動套用")
+        return True
 
     def _calibrate_digits(self):
         if not self.exp_offset:
@@ -3490,6 +3815,11 @@ OCR 診斷
         self.running = True
         if self.session_start is None:
             self.session_start = time.time()
+            self._paused_duration = 0.0
+            self._pause_started_at = None
+        elif self._pause_started_at is not None:
+            self._paused_duration += max(0.0, time.time() - self._pause_started_at)
+            self._pause_started_at = None
         threading.Thread(target=self._loop, daemon=True).start()
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
@@ -3500,6 +3830,8 @@ OCR 診斷
 
     def stop(self):
         self.running = False
+        if self.session_start is not None and self._pause_started_at is None:
+            self._pause_started_at = time.time()
         if self._compact_mode:
             self._show_full_window()
         self.start_btn.config(state="normal" if self.exp_offset else "disabled")
@@ -3507,6 +3839,20 @@ OCR 診斷
         self.compact_btn.config(state="disabled")
         self.live_lbl.set("待命", self.colors["panel_2"], self.colors["muted_text"])
         self.status.config(text="已停止")
+
+    def _effective_elapsed(self, now=None):
+        if self.session_start is None:
+            return 0.0
+        now = now if now is not None else time.time()
+        paused = self._paused_duration
+        if self._pause_started_at is not None:
+            paused += max(0.0, now - self._pause_started_at)
+        return max(0.0, now - self.session_start - paused)
+
+    def _sample_time(self, now=None):
+        if self.session_start is None:
+            return now if now is not None else time.time()
+        return self.session_start + self._effective_elapsed(now)
 
     def reset(self):
         self.stop()
@@ -3516,18 +3862,7 @@ OCR 診斷
         self._last_pct = None
         self._estimated_level = None
         self._level_estimate_error = None
-        self._pending_raw = None
-        self._pending_pct = None
-        self._pending_at = None
-        self._pending_jump_raw = None
-        self._pending_jump_pct = None
-        self._pending_jump_at = None
-        self._pending_level_reset_raw = None
-        self._pending_level_reset_pct = None
-        self._pending_level_reset_previous_raw = None
-        self._pending_level_reset_previous_pct = None
-        self._pending_level_reset_at = None
-        self._pending_level_reset_count = 0
+        self._pending = PendingState()
         self._manual_exp_floor_raw = None
         self._manual_exp_floor_level = None
         self._level_cap = None
@@ -3543,8 +3878,18 @@ OCR 診斷
         self._last_ocr_text = ""
         self._last_ocr_state = ""
         self._last_ocr_at = None
+        self._last_ocr_result = OCRResult()
+        self._last_sample_status = SampleStatus()
         self._last_error = ""
         self.session_start = None
+        self._paused_duration = 0.0
+        self._pause_started_at = None
+        self._level_ocr_votes.clear()
+        self._level_ocr_tick = 0
+        self._level_ocr_last = None
+        self._level_ocr_text = ""
+        self._level_ocr_state = "等待追蹤" if self.level_offset else "未設定"
+        self._level_ocr_at = None
         self.cur_lbl.config(text="目前 EXP：—")
         self.elapsed_lbl.config(text="00:00:00")
         self.gained_lbl.config(text="0")
@@ -3562,7 +3907,8 @@ OCR 診斷
             self.compact_level_lbl.config(text="—")
 
     def _apply_manual_exp_correction(self, raw, pct):
-        now = time.time()
+        now_wall = time.time()
+        now = self._sample_time(now_wall)
         previous_raw = self._last_raw
         previous_pct = self._last_pct
         adjustment = 0
@@ -3609,7 +3955,7 @@ OCR 診斷
             correction_text = f"手動校正：{raw:,}"
         self._last_ocr_text = correction_text
         self._last_ocr_state = "已採用"
-        self._last_ocr_at = now
+        self._last_ocr_at = now_wall
         self._last_error = ""
         rate_text, eta5_text, eta10_text, eta30_text, level_eta_text = self._rate_display_values()
         self.rate_lbl.config(text=rate_text)
@@ -4072,17 +4418,10 @@ OCR 診斷
         return corrected
 
     def _clear_pending_jump(self):
-        self._pending_jump_raw = None
-        self._pending_jump_pct = None
-        self._pending_jump_at = None
+        self._pending.clear_jump()
 
     def _clear_pending_level_reset(self):
-        self._pending_level_reset_raw = None
-        self._pending_level_reset_pct = None
-        self._pending_level_reset_previous_raw = None
-        self._pending_level_reset_previous_pct = None
-        self._pending_level_reset_at = None
-        self._pending_level_reset_count = 0
+        self._pending.clear_level_reset()
 
     def _pending_level_reset_repeats(self, raw, pct):
         if self._pending_level_reset_raw is None:
@@ -4755,20 +5094,54 @@ OCR 診斷
         )
         return corrected
 
+    def _apply_exp_correction_pipeline(self, raw, pct, visual_pct):
+        if raw is None:
+            return raw, pct, []
+
+        def raw_step(label, fn):
+            def step(cur_raw, cur_pct, ctx):
+                next_raw = fn(cur_raw, cur_pct, ctx.visual_pct)
+                return next_raw, cur_pct, label if next_raw != cur_raw else None
+            return step
+
+        def pct_step(label, fn):
+            def step(cur_raw, cur_pct, ctx):
+                next_pct = fn(cur_raw, cur_pct, ctx.visual_pct)
+                return cur_raw, next_pct, label if next_pct != cur_pct else None
+            return step
+
+        steps = [
+            raw_step("依上一筆修正 8/9 混淆", self._correct_8_to_9_by_previous_raw),
+            pct_step("依等級修正百分比 8/9 混淆", lambda cur_raw, cur_pct, _visual: self._correct_pct_8_to_9_by_manual_level(cur_raw, cur_pct)),
+            pct_step("依等級與進度修正百分比", self._correct_pct_by_manual_level_and_step),
+            raw_step("依等級與進度修正相似數字", self._correct_confused_digits_by_context),
+            pct_step("依等級與進度修正百分比", self._correct_pct_by_manual_level_and_step),
+            raw_step("依等級與百分比補回少讀前綴", self._correct_missing_prefix_by_manual_level_pct),
+            raw_step("依等級與百分比修正首位", self._correct_leading_digit_by_manual_level_pct),
+            raw_step("依等級上限移除多讀位數", self._correct_inserted_digit_by_level_cap),
+            raw_step("依等級與進度修正相似數字", self._correct_confused_digits_by_context),
+            pct_step("依等級與進度修正百分比", self._correct_pct_by_manual_level_and_step),
+            raw_step("依上下文修正 8/9 混淆", lambda cur_raw, cur_pct, _visual: self._correct_8_to_9_by_context(cur_raw, cur_pct)),
+        ]
+        result = apply_pipeline(
+            raw,
+            pct,
+            CorrectionContext(
+                visual_pct=visual_pct,
+                manual_level=self._manual_level,
+                level_cap=self._level_cap,
+                last_raw=self._last_raw,
+                last_pct=self._last_pct,
+            ),
+            steps,
+        )
+        return result.raw, result.pct, result.reasons
+
     def _stabilize_overlay_sample(self, raw, pct, visual_pct, overlay_threshold=None):
         if raw is None:
             return raw, pct
         threshold = overlay_threshold if overlay_threshold is not None else self._overlay_threshold_pct(raw, pct)
-        raw = self._correct_8_to_9_by_previous_raw(raw, pct, visual_pct)
-        pct = self._correct_pct_8_to_9_by_manual_level(raw, pct)
-        pct = self._correct_pct_by_manual_level_and_step(raw, pct, visual_pct)
-        raw = self._correct_confused_digits_by_context(raw, pct, visual_pct)
-        pct = self._correct_pct_by_manual_level_and_step(raw, pct, visual_pct)
-        raw = self._correct_missing_prefix_by_manual_level_pct(raw, pct, visual_pct)
-        raw = self._correct_leading_digit_by_manual_level_pct(raw, pct, visual_pct)
-        raw = self._correct_inserted_digit_by_level_cap(raw, pct, visual_pct)
-        raw = self._correct_confused_digits_by_context(raw, pct, visual_pct)
-        pct = self._correct_pct_by_manual_level_and_step(raw, pct, visual_pct)
+        raw, pct, _corrections = self._apply_exp_correction_pipeline(raw, pct, visual_pct)
         self._note_manual_level_mismatch(raw, pct, visual_pct)
         if self._level_cap is not None and self._last_raw is not None:
             raw, pct = self._protect_unstable_overlay_raw(raw, pct, visual_pct, reason="讀值偏離進度")
@@ -4824,11 +5197,7 @@ OCR 診斷
             return "已忽略"
         if accepted:
             return "已採用"
-        if (
-            self._pending_raw is not None
-            or self._pending_jump_raw is not None
-            or self._pending_level_reset_raw is not None
-        ):
+        if self._pending.any_pending():
             return "待確認"
         return "已忽略"
 
@@ -4849,6 +5218,7 @@ OCR 診斷
                     pil = Image.frombytes("RGB", shot.size, shot.rgb)
                     raw, pct, text = ocr_exp_detail(pil)
                     visual_pct = estimate_bar_percent(pil)
+                    self._last_ocr_result = OCRResult(raw=raw, pct=pct, visual_pct=visual_pct, text=text)
                     self._capture_count += 1
                     self._last_ocr_text = text
                     self._last_ocr_state = "待判斷"
@@ -4858,10 +5228,34 @@ OCR 診斷
                     raw, pct = self._stabilize_overlay_sample(raw, pct, visual_pct, overlay_threshold)
                     accepted = False
                     if raw is not None:
-                        accepted = self._add_sample(time.time(), raw, pct, visual_pct)
+                        accepted = self._add_sample(self._sample_time(), raw, pct, visual_pct)
                         if accepted:
                             self._recognized_count += 1
+                    if self.level_offset and self._level_ocr_tick % LEVEL_OCR_INTERVAL_TICKS == 0:
+                        lx, ly, lw, lh = self.level_offset
+                        level_region = {"left": wx + lx, "top": wy + ly, "width": lw, "height": lh}
+                        level_shot = sct.grab(level_region)
+                        level_img = Image.frombytes("RGB", level_shot.size, level_shot.rgb)
+                        self._submit_level_ocr(
+                            recognize_level(
+                                level_img,
+                                ocr_texts,
+                                normalize_ocr_text,
+                                MIN_MAPLESTAR_LEVEL,
+                                MAX_MAPLESTAR_LEVEL,
+                                return_details=True,
+                            )
+                        )
+                    self._level_ocr_tick += 1
                     self._last_ocr_state = self._classify_last_sample_state(accepted, raw)
+                    self._last_sample_status = SampleStatus(
+                        accepted=accepted,
+                        state=self._last_ocr_state,
+                        reason=self._last_ocr_text,
+                        corrections=list(self._last_sample_status.corrections),
+                        raw_after=raw,
+                        pct_after=pct,
+                    )
                 except Exception as e:
                     self._last_error = str(e)
                     self._last_ocr_state = "錯誤"
@@ -4874,20 +5268,12 @@ OCR 診斷
         previous_raw = self._last_raw
         previous_pct = self._last_pct
         suspicious = False
+        self._last_sample_status = SampleStatus(raw_after=raw, pct_after=pct)
 
         if raw is None:
             return False
-        raw = self._correct_8_to_9_by_previous_raw(raw, pct, visual_pct)
-        pct = self._correct_pct_8_to_9_by_manual_level(raw, pct)
-        pct = self._correct_pct_by_manual_level_and_step(raw, pct, visual_pct)
-        raw = self._correct_confused_digits_by_context(raw, pct, visual_pct)
-        pct = self._correct_pct_by_manual_level_and_step(raw, pct, visual_pct)
-        raw = self._correct_missing_prefix_by_manual_level_pct(raw, pct, visual_pct)
-        raw = self._correct_leading_digit_by_manual_level_pct(raw, pct, visual_pct)
-        raw = self._correct_inserted_digit_by_level_cap(raw, pct, visual_pct)
-        raw = self._correct_confused_digits_by_context(raw, pct, visual_pct)
-        pct = self._correct_pct_by_manual_level_and_step(raw, pct, visual_pct)
-        raw = self._correct_8_to_9_by_context(raw, pct)
+        raw, pct, corrections = self._apply_exp_correction_pipeline(raw, pct, visual_pct)
+        self._last_sample_status.corrections = corrections
         self._note_manual_level_mismatch(raw, pct, visual_pct)
         if self._below_manual_exp_floor(raw, pct):
             self._clear_pending_jump()
@@ -5088,63 +5474,7 @@ OCR 診斷
         return True
 
     def _rate_per_min(self, window_s: float):
-        if len(self.samples) < 2:
-            return None
-        now = time.time()
-        cutoff = now - window_s
-        window_samples = []
-        previous = None
-        for sample in self.samples:
-            if sample[0] < cutoff:
-                previous = sample
-                continue
-            if previous is not None and not window_samples:
-                window_samples.append(previous)
-            window_samples.append(sample)
-        if len(window_samples) < 2:
-            return None
-
-        span = window_samples[-1][0] - window_samples[0][0]
-        if span < 20:
-            return None
-
-        segments = []
-        for previous, current in zip(window_samples, window_samples[1:]):
-            dt = current[0] - previous[0]
-            gained = current[1] - previous[1]
-            if dt <= 0 or gained < 0:
-                continue
-            segments.append((dt, gained, gained / (dt / 60)))
-
-        if not segments:
-            return 0
-
-        filtered = segments
-        positive_rates = sorted(rate for _dt, gained, rate in segments if gained > 0)
-        if len(positive_rates) >= RATE_OUTLIER_MIN_POSITIVE_SEGMENTS:
-            mid = len(positive_rates) // 2
-            if len(positive_rates) % 2:
-                median_rate = positive_rates[mid]
-            else:
-                median_rate = (positive_rates[mid - 1] + positive_rates[mid]) / 2
-            deviations = sorted(abs(rate - median_rate) for rate in positive_rates)
-            dev_mid = len(deviations) // 2
-            if len(deviations) % 2:
-                mad = deviations[dev_mid]
-            else:
-                mad = (deviations[dev_mid - 1] + deviations[dev_mid]) / 2
-            outlier_limit = max(
-                median_rate * RATE_OUTLIER_MULTIPLIER,
-                median_rate + max(mad * RATE_OUTLIER_MAD_MULTIPLIER, MIN_DELTA_TOLERANCE * 60),
-            )
-            filtered = [
-                (dt, gained, rate)
-                for dt, gained, rate in segments
-                if gained == 0 or rate <= outlier_limit
-            ]
-
-        trusted_gained = sum(gained for _dt, gained, _rate in filtered)
-        return trusted_gained / (span / 60)
+        return self.rate_view.rate_per_min(window_s, now=self._sample_time())
 
     def _format_eta_duration(self, seconds):
         if seconds < 60:
@@ -5195,7 +5525,8 @@ OCR 診斷
         if pending_level is not None:
             return f"Lv {pending_level}（確認中）"
         if self._manual_level is not None:
-            return f"Lv {self._manual_level}（校正）"
+            source = "OCR" if self._level_source == "ocr" else "校正"
+            return f"Lv {self._manual_level}（{source}）"
         if self._estimated_level is None:
             return "—"
         return f"Lv {self._estimated_level}"
@@ -5255,7 +5586,7 @@ OCR 診斷
             self.cur_lbl.config(text=f"目前 EXP：{current_text}")
 
         if self.session_start:
-            elapsed = time.time() - self.session_start
+            elapsed = self._effective_elapsed()
             hh, rem = divmod(int(elapsed), 3600)
             mm, ss = divmod(rem, 60)
             self.elapsed_lbl.config(text=f"{hh:02}:{mm:02}:{ss:02}")
@@ -5284,6 +5615,14 @@ OCR 診斷
             parts.append(f"校正 Lv {self._manual_level}")
         elif self._estimated_level is not None:
             parts.append(f"推估 Lv {self._estimated_level}")
+        if self.level_offset:
+            level_part = f"等級OCR {self._level_ocr_state or '待命'}"
+            if self._level_ocr_last is not None:
+                level_part += f" Lv {self._level_ocr_last}"
+            if self._level_ocr_at:
+                level_ago = max(0, int(time.time() - self._level_ocr_at))
+                level_part += f"（{level_ago} 秒前）"
+            parts.append(level_part)
         if self._ignored_samples:
             parts.append(f"已忽略異常 {self._ignored_samples} 次")
         if self._last_error:
@@ -5298,10 +5637,17 @@ OCR 診斷
         if not text:
             text = "—"
         state = self._last_ocr_state or "待命"
-        self.ocr_text_lbl.config(text=f"最後讀取（{state}）：{text}", wraplength=diag_width)
+        if self.level_offset:
+            level_state = self._level_ocr_state or "待命"
+            level_text = " ".join((self._level_ocr_text or "").split()) or "—"
+            diag_text = f"最後讀取（{state}）：{text}\n等級OCR（{level_state}）：{level_text}"
+        else:
+            diag_text = f"最後讀取（{state}）：{text}"
+        self.ocr_text_lbl.config(text=diag_text, wraplength=diag_width)
 
 
 def main():
+    _write_crash_log(f"=== {APP_TITLE} 啟動 {time.strftime('%Y-%m-%d %H:%M:%S')} ===")
     if "--self-test-ocr" in sys.argv:
         engine = _pp_ocr_engine()
         if engine is not None:
@@ -5347,5 +5693,20 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
-
+    try:
+        main()
+    except SystemExit:
+        raise
+    except BaseException as e:
+        detail = f"FATAL: {type(e).__name__}: {e}\n{traceback.format_exc()}"
+        _write_crash_log(detail)
+        try:
+            r = tk.Tk()
+            r.withdraw()
+            messagebox.showerror(
+                "程式啟動失敗",
+                f"程式發生未預期錯誤，已寫入 crash log：\n{CRASH_LOG_PATH}\n\n{e}",
+            )
+        except Exception:
+            print(detail, file=sys.stderr)
+        sys.exit(1)
