@@ -1,8 +1,8 @@
 # UTF-8
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(2026, 5, 27, 5),
-    prodvers=(2026, 5, 27, 5),
+    filevers=(2026, 6, 7, 1),
+    prodvers=(2026, 6, 7, 1),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -17,11 +17,11 @@ VSVersionInfo(
         [
           StringStruct('CompanyName', 'MapleStar EXP Tracker'),
           StringStruct('FileDescription', 'MapleStar EXP Tracker'),
-          StringStruct('FileVersion', '2026.05.27.005'),
+          StringStruct('FileVersion', '2026.06.07.001'),
           StringStruct('InternalName', 'MapleStar-EXP-Tracker'),
           StringStruct('OriginalFilename', 'MapleStar-EXP-Tracker.exe'),
           StringStruct('ProductName', 'MapleStar EXP Tracker'),
-          StringStruct('ProductVersion', '2026.05.27.005'),
+          StringStruct('ProductVersion', '2026.06.07.001'),
         ],
       ),
     ]),

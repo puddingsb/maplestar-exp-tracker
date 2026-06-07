@@ -21,7 +21,7 @@ import threading
 import time
 import tkinter as tk
 import traceback
-from collections import deque
+from collections import Counter, deque
 from pathlib import Path
 from tkinter import messagebox, simpledialog, ttk
 
@@ -54,7 +54,7 @@ except ImportError:
     pwc = None
 
 
-APP_VERSION = "v2026.05.27.005"
+APP_VERSION = "v2026.06.07.001"
 APP_NAME = "MapleStar EXP Tracker"
 APP_TITLE = f"MapleStar EXP Tracker {APP_VERSION}"
 APP_AUTHOR = "作者 by 胖胖布丁小紅"
@@ -1331,8 +1331,8 @@ def _pp_ocr_engine():
         return None
 
 
-def _ocr_input_image(image: Image.Image):
-    prepared = neutralize_green_bar_for_ocr(image)
+def _ocr_input_image(image: Image.Image, neutralize=True):
+    prepared = neutralize_green_bar_for_ocr(image) if neutralize else image.convert("RGB")
     if prepared.height <= 0:
         return prepared
     if prepared.height >= OCR_UPSCALE_MIN_HEIGHT:
@@ -1346,11 +1346,11 @@ def _ocr_input_image(image: Image.Image):
     )
 
 
-def ocr_texts(image: Image.Image):
+def ocr_texts(image: Image.Image, neutralize=True):
     engine = _pp_ocr_engine()
     if engine is None:
         return []
-    prepared = _ocr_input_image(image)
+    prepared = _ocr_input_image(image, neutralize=neutralize)
     out = []
     try:
         result = engine.predict(np.array(prepared))
@@ -1523,39 +1523,69 @@ def ocr_diagnostic_text(engine_name, raw, pct, source_text):
 def ocr_exp_detail(image: Image.Image):
     original = image.convert("RGB")
     candidates = ocr_candidate_images(original)
-    variants = []
-    best_text = ""
-    best_engine = "PP-OCRv5（去綠條預處理）"
-    best = (None, None)
-    best_score = -1
-
+    variants = ocr_variants(original)
     visual_pct = estimate_bar_percent(original)
-    for text, confidence in ocr_texts(original):
-        bracket_raw = raw_before_bracket(text)
-        raw, pct = parse_ocr_text(text, visual_pct=visual_pct)
-        if bracket_raw is not None:
-            raw = bracket_raw
-        if text and not best_text:
-            best_text = text
-            best_engine = "PP-OCRv5（去綠條預處理）"
-        score = _ocr_score(raw, pct, text, confidence)
-        if score > best_score:
-            best = (raw, pct)
-            best_text = text
-            best_engine = "PP-OCRv5（去綠條預處理）"
-            best_score = score
-        if raw is not None and pct is not None and confidence >= 0.70:
-            diagnostic = ocr_diagnostic_text(best_engine, best[0], best[1], best_text)
-            _save_ocr_debug(image, candidates, variants, diagnostic, best_engine)
-            return best[0], best[1], diagnostic
+    readings = []
 
-    if not best_text and _PP_OCR_ERROR:
-        best_text = _PP_OCR_ERROR
-        best_engine = "PP-OCRv5 初始化失敗"
+    base_sources = [
+        ("去綠條", original, True),
+        ("原始圖", original, False),
+    ]
+    seen_sources = set()
+    def collect_sources(sources):
+        for source_label, source_image, neutralize in sources:
+            key = (source_image.size, source_image.tobytes(), neutralize)
+            if key in seen_sources:
+                continue
+            seen_sources.add(key)
+            for text, confidence in ocr_texts(source_image, neutralize=neutralize):
+                bracket_raw = raw_before_bracket(text)
+                raw, pct = parse_ocr_text(text, visual_pct=visual_pct)
+                if bracket_raw is not None:
+                    raw = bracket_raw
+                if raw is None and pct is None:
+                    continue
+                readings.append((raw, pct, text, confidence, source_label))
 
-    diagnostic = ocr_diagnostic_text(best_engine, best[0], best[1], best_text)
-    _save_ocr_debug(image, candidates, variants, diagnostic, best_engine)
-    return best[0], best[1], diagnostic
+    collect_sources(base_sources)
+    base_raws = {raw for raw, _pct, _text, _confidence, _source in readings if raw is not None}
+    if len(base_raws) != 1:
+        crop_sources = [
+            (f"文字裁切{idx}", crop.convert("RGB"), False)
+            for idx, crop in enumerate(exp_text_crops(original)[:2], start=1)
+        ]
+        collect_sources(crop_sources)
+
+    vision_raw, vision_confidence, vision_text = vision_read_raw_digits(original, visual_pct)
+    if vision_raw is not None:
+        readings.append((vision_raw, visual_pct, vision_text, vision_confidence, "視覺數字"))
+
+    if not readings:
+        error_text = _PP_OCR_ERROR or ""
+        engine_name = "PP-OCRv5 初始化失敗" if error_text else "PP-OCRv5（多候選投票）"
+        diagnostic = ocr_diagnostic_text(engine_name, None, None, error_text)
+        _save_ocr_debug(image, candidates, variants, diagnostic, engine_name)
+        return None, None, diagnostic
+
+    raw_counts = Counter(raw for raw, _pct, _text, _confidence, _source in readings if raw is not None)
+
+    def reading_score(reading):
+        raw, pct, text, confidence, source_label = reading
+        score = _ocr_score(raw, pct, text, confidence, visual_pct=visual_pct)
+        if raw is not None:
+            score += raw_counts[raw] * 500
+        if source_label == "去綠條":
+            score += 30
+        elif source_label == "視覺數字":
+            score += 20
+        return score
+
+    best_raw, best_pct, best_text, _best_confidence, best_source = max(readings, key=reading_score)
+    vote_count = raw_counts.get(best_raw, 0) if best_raw is not None else 0
+    engine_name = f"PP-OCRv5（多候選投票 {vote_count} 票 / {best_source}）"
+    diagnostic = ocr_diagnostic_text(engine_name, best_raw, best_pct, best_text)
+    _save_ocr_debug(image, candidates, variants, diagnostic, engine_name)
+    return best_raw, best_pct, diagnostic
 
 
 def ocr_exp(image: Image.Image):
@@ -4035,9 +4065,14 @@ OCR 診斷
         return self._raw_matches_level_progress(raw, pct, next_cap)
 
     def _expected_raw_from_pct(self, pct):
-        if self._level_cap is None or pct is None or pct < 0:
+        if pct is None or pct < 0:
             return None
-        return self._level_cap * (pct / 100)
+        level_cap = self._level_cap
+        if self._manual_level is not None:
+            level_cap = float(MAPLESTAR_EXP_BY_LEVEL[self._manual_level])
+        if level_cap is None:
+            return None
+        return level_cap * (pct / 100)
 
     def _reference_progress_pct(self, pct, visual_pct=None):
         pct_valid = pct is not None and 0 <= pct <= 100
@@ -4256,8 +4291,6 @@ OCR 診斷
             and abs(pct - visual_pct) > PCT_VISUAL_MISMATCH_TOLERANCE
         ):
             return False
-        if self._below_manual_exp_floor(raw, pct):
-            return False
         if self._sample_suggests_different_manual_level(raw, pct, visual_pct):
             return True
 
@@ -4272,6 +4305,8 @@ OCR 診斷
             current_distance = abs(raw - expected_raw)
             if current_distance + tolerance < previous_distance:
                 return True
+        if self._below_manual_exp_floor(raw, pct):
+            return False
 
         if len(self.samples) >= 2:
             _t, _gained, stable_raw, stable_pct = self.samples[-2]
