@@ -54,7 +54,7 @@ except ImportError:
     pwc = None
 
 
-APP_VERSION = "v2026.06.07.001"
+APP_VERSION = "v2026.06.08.001"
 APP_NAME = "MapleStar EXP Tracker"
 APP_TITLE = f"MapleStar EXP Tracker {APP_VERSION}"
 APP_AUTHOR = "作者 by 胖胖布丁小紅"
@@ -1420,6 +1420,29 @@ def ocr_variants(image: Image.Image):
     return variants
 
 
+def _is_active_exp_fill_pixel(r, g, b):
+    return (
+        g > 150
+        and r > 105
+        and b < 105
+        and g >= r
+        and (g - b) > 70
+        and (r - b) > 45
+    )
+
+
+def _is_exp_bar_pixel(r, g, b):
+    gray_bar = (
+        45 <= r <= 150
+        and 45 <= g <= 150
+        and 45 <= b <= 150
+        and abs(r - g) < 35
+        and abs(g - b) < 35
+    )
+    rest_or_exp = g > 100 and r > 70 and b < 150 and g >= r and g - b > 20
+    return gray_bar or rest_or_exp
+
+
 def estimate_bar_percent(image: Image.Image):
     rgb = image.convert("RGB")
     w, h = rgb.size
@@ -1431,7 +1454,7 @@ def estimate_bar_percent(image: Image.Image):
         hits = 0
         for y in range(max(0, int(h * 0.18)), min(h, int(h * 0.82))):
             r, g, b = pixels[x, y]
-            if g > 135 and r > 95 and b < 115 and g >= r and g - b > 40:
+            if _is_active_exp_fill_pixel(r, g, b):
                 hits += 1
         col_hits.append(hits)
 
@@ -1449,9 +1472,7 @@ def estimate_bar_percent(image: Image.Image):
         hits = 0
         for y in range(max(0, int(h * 0.18)), min(h, int(h * 0.82))):
             r, g, b = pixels[x, y]
-            gray_bar = 45 <= r <= 150 and 45 <= g <= 150 and 45 <= b <= 150 and abs(r - g) < 35 and abs(g - b) < 35
-            green_bar = g > 100 and r > 70 and b < 140 and g >= r and g - b > 25
-            if gray_bar or green_bar:
+            if _is_exp_bar_pixel(r, g, b):
                 hits += 1
         if hits >= threshold:
             bar_cols.append(x)
